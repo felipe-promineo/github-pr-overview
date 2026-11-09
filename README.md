@@ -2,7 +2,7 @@
 
 A small local web page that shows your open GitHub pull requests as a board, and sends a macOS notification when one needs you.
 
-Columns:
+Default columns:
 
 - **Draft**
 - **Ready for review (no reviewer)**
@@ -11,9 +11,20 @@ Columns:
 - **Ready for merge**: approved (tagged "CI running" while checks are pending)
 - **Needs my review**: other people's PRs where you or one of your teams is a requested reviewer
 
-The page refreshes every 2 minutes. In the background it checks every 2 minutes as well, and plays a sound and shows a notification for every PR that newly lands in **Needs action**, **Ready for merge** or **Needs my review**. Clicking the notification opens the PR.
+By default the page and a background check refresh every 2 minutes, and a sound plays and a notification shows for every PR that newly lands in **Needs action**, **Ready for merge** or **Needs my review**. Clicking the notification opens the PR. The header shows which `gh` account the board is for.
 
-Everything runs on your machine with your own `gh` login: the page is served on `127.0.0.1` only, and nothing is stored.
+Everything runs on your machine with your own `gh` login, and the page is served on `127.0.0.1` only.
+
+## Settings
+
+The **Settings** link on the board opens a page where you can change:
+
+- whether empty columns collapse into a thin bar
+- the refresh interval, or turn auto-refresh off so the board (and notifications) only update when you reload the page
+- whether notifications show, and their sound (any macOS system sound, or none; **Play** previews it)
+- per column: title, color, the [GitHub search query](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests) it shows, the rule that filters the query's results (draft, no reviewer, waiting for reviewer, needs action, approved, or every PR), and whether it notifies
+
+**Reset to defaults** restores the board above. Settings are saved in `~/.config/github-pr-overview/settings.json`.
 
 ## Requirements
 
