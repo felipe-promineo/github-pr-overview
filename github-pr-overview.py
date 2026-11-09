@@ -904,6 +904,11 @@ STYLE = """
   .conditions { flex-direction: column; align-items: flex-start; }
   .summary { margin: 8px 0 0; }
   .actions { display: flex; gap: 12px; align-items: center; }
+  dialog { background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 8px; padding: 20px; max-width: 420px; }
+  dialog::backdrop { background: rgba(1, 4, 9, 0.7); }
+  dialog h2 { font-size: 16px; margin: 0 0 8px; display: block; }
+  dialog p { margin: 0 0 16px; color: #8b949e; }
+  dialog .actions { justify-content: flex-end; }
   .repo-tools { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
   .repo-tools input[type=search] { flex: 1 1 260px; }
   .repo-picker { max-height: 360px; overflow: auto; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; padding: 4px 12px; }
@@ -1416,6 +1421,44 @@ async function loadRepositories(reload) {
 
 repoFilter.addEventListener('input', filterRepositories);
 loadRepositories(false);
+
+const settingsForm = document.querySelector('form');
+const leaveDialog = document.getElementById('leave-dialog');
+function formState() {
+  return JSON.stringify([...new FormData(settingsForm)].filter(([name]) => name !== 'next'));
+}
+let savedState = formState();
+let leaving = false;
+let destination = null;
+setTimeout(() => { savedState = formState(); }, 0);
+const hasChanges = () => !leaving && formState() !== savedState;
+
+settingsForm.addEventListener('submit', () => { leaving = true; });
+window.addEventListener('beforeunload', event => {
+  if (hasChanges()) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+document.addEventListener('click', event => {
+  const link = event.target.closest('a[href]');
+  if (!link || link.target === '_blank' || event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || !hasChanges()) {
+    return;
+  }
+  event.preventDefault();
+  destination = link.getAttribute('href');
+  leaveDialog.showModal();
+});
+document.getElementById('leave-save').addEventListener('click', () => {
+  leaveDialog.close();
+  settingsForm.querySelector('[name=next]').value = destination;
+  settingsForm.requestSubmit(settingsForm.querySelector('button.primary'));
+});
+document.getElementById('leave-discard').addEventListener('click', () => {
+  leaving = true;
+  location.href = destination;
+});
+document.getElementById('leave-stay').addEventListener('click', () => leaveDialog.close());
 """
 
 
@@ -1428,15 +1471,23 @@ def settings_script(rules):
     )
 
 
-def render_moving(port):
+def local_path(value):
+    parts = urlsplit(value)
+    if value.startswith("/") and not value.startswith("//") and "\\" not in value and not parts.scheme and not parts.netloc:
+        return value
+    return ""
+
+
+def render_moving(port, next_path):
     url = board_url(port)
+    target = json.dumps(url + (next_path or "/settings?saved")).replace("</", "<\\/")
     content = f"""<h1>Moving to port {port}</h1>
-<p>The board is restarting on <a href="{url}/settings?saved">{url}</a>. This page follows it when it's up.</p>
+<p>The board is restarting on <a href="{url}{html.escape(next_path or '/settings?saved')}">{url}</a>. This page follows it when it's up.</p>
 <script>
 async function follow() {{
   try {{
     await fetch('{url}/', {{mode: 'no-cors', cache: 'no-store'}});
-    location.href = '{url}/settings?saved';
+    location.href = {target};
   }} catch (error) {{
     setTimeout(follow, 300);
   }}
@@ -1529,12 +1580,22 @@ def render_settings(overview, saved, port_in_use):
     <template id="rule-template">{rule_card("__R__", {"id": "", "name": "New rule", "match": "all", "conditions": []}, rules)}</template>
     <template id="condition-template">{condition_row("__R__", "draft", "yes", rules, "")}</template>
   </fieldset>
+  <input type="hidden" name="next" value="">
   <div class="actions">
     <button type="submit" class="primary">Save</button>
     <button type="submit" formaction="/settings/reset" onclick="return confirm('Reset every setting to its default?')">Reset to defaults</button>
     {notice}
   </div>
 </form>
+<dialog id="leave-dialog">
+  <h2>Unsaved changes</h2>
+  <p>You changed settings without saving them. Save them before leaving?</p>
+  <div class="actions">
+    <button type="button" id="leave-stay">Stay</button>
+    <button type="button" id="leave-discard">Leave without saving</button>
+    <button type="button" id="leave-save" class="primary">Save and leave</button>
+  </div>
+</dialog>
 <script>{settings_script(rules)}</script>"""
     return page("Settings · GitHub PR overview", banner(settings, overview.current_viewer(), True), content)
 
@@ -1553,7 +1614,7 @@ class Handler(BaseHTTPRequestHandler):
             max_age = int(max_age) if max_age.isdigit() else FRESH_SECONDS
             self.respond(board_content(overview.fresh_board(max_age)))
         elif url.path == "/settings":
-            query = parse_qs(url.query)
+            query = parse_qs(url.query, keep_blank_values=True)
             self.respond(render_settings(overview, "saved" in query, query.get("port_in_use", [""])[0]))
         elif url.path == "/repositories":
             try:
@@ -1576,9 +1637,9 @@ class Handler(BaseHTTPRequestHandler):
         overview = self.server.overview
         path = urlsplit(self.path).path
         if path == "/settings":
-            self.apply_settings(settings_from_form(form))
+            self.apply_settings(settings_from_form(form), local_path(form.get("next", [""])[0]))
         elif path == "/settings/reset":
-            self.apply_settings(normalized_settings({}))
+            self.apply_settings(normalized_settings({}), "")
         elif path == "/settings/sound":
             play_sound(form.get("sound", [""])[0])
             self.send_response(204)
@@ -1586,7 +1647,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def apply_settings(self, settings):
+    def apply_settings(self, settings, next_path):
         running_port = self.server.server_port
         wanted_port = settings["port"]
         if wanted_port != running_port and not port_is_free(wanted_port):
@@ -1594,13 +1655,13 @@ class Handler(BaseHTTPRequestHandler):
         save_settings(settings)
         self.server.overview.change_settings(settings)
         if settings["port"] != running_port:
-            self.respond(render_moving(settings["port"]))
+            self.respond(render_moving(settings["port"], next_path))
             self.server.restart = True
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         elif wanted_port != running_port:
             self.redirect(f"/settings?saved&port_in_use={wanted_port}")
         else:
-            self.redirect("/settings?saved")
+            self.redirect(next_path or "/settings?saved")
 
     def respond(self, text, status=200):
         body = text.encode()
