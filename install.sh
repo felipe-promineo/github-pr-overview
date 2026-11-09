@@ -6,7 +6,7 @@ DEFAULT_DIR="$HOME/Repositories/github-pr-overview"
 LABEL="github-pr-overview"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SERVICE="gui/$(id -u)/$LABEL"
-URL="http://127.0.0.1:8765"
+PORT_ATTEMPTS=50
 LOG="/tmp/github-pr-overview.log"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -15,11 +15,13 @@ fail() { printf '\n\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: install.sh [--dir PATH] [--no-browser] [--uninstall]
+Usage: install.sh [--dir PATH] [--port PORT] [--no-browser] [--uninstall]
 
 Installs GitHub PR overview and starts it at login. Run it again to update.
 
   --dir PATH     where to clone the app (default: $DEFAULT_DIR)
+  --port PORT    serve the board on PORT (default: the port in its settings,
+                 8765 at first; the next free one when that is in use)
   --no-browser   don't open the board when done
   --uninstall    stop the app and remove the login item and gh aliases
                  (keeps the clone and ~/.config/github-pr-overview)
@@ -49,10 +51,12 @@ uninstall() {
 }
 
 app_dir=""
+requested_port=""
 open_browser=true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dir) [[ $# -ge 2 ]] || fail "--dir needs a path"; app_dir="$2"; shift 2 ;;
+    --port) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || fail "--port needs a number from 1024 to 65535"; requested_port="$2"; shift 2 ;;
     --no-browser) open_browser=false; shift ;;
     --uninstall) uninstall; exit 0 ;;
     -h|--help) usage; exit 0 ;;
@@ -118,11 +122,43 @@ fi
 app_dir="$(cd "$app_dir" && pwd)"
 [[ -f "$app_dir/github-pr-overview.py" && -f "$app_dir/github-pr-overview.plist" ]] || fail "$app_dir doesn't contain the app."
 
-step "Setting up the login item"
+app="$app_dir/github-pr-overview.py"
+
+port_is_free() {
+  "$python" -c '
+import socket, sys
+with socket.socket() as probe:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError:
+        sys.exit(1)
+' "$1"
+}
+
+step "Choosing the port"
 stop_service
-if curl -fsS -o /dev/null --max-time 2 "$URL" 2>/dev/null; then
-  fail "Something else already serves $URL (maybe python3 github-pr-overview.py in a terminal). Stop it and run this installer again."
+saved_port="$("$python" "$app" --show-port)"
+port="${requested_port:-$saved_port}"
+if ! port_is_free "$port"; then
+  [[ -z "$requested_port" ]] || fail "Port $port is in use. Pick another one with --port."
+  taken="$port"
+  for ((candidate = port + 1; candidate <= port + PORT_ATTEMPTS && candidate <= 65535; candidate++)); do
+    if port_is_free "$candidate"; then
+      port="$candidate"
+      break
+    fi
+  done
+  [[ "$port" != "$taken" ]] || fail "Ports $taken to $((taken + PORT_ATTEMPTS)) are all in use. Pick a free one with --port."
+  note "Port $taken is in use, so the board uses $port instead"
 fi
+if [[ "$port" != "$saved_port" ]]; then
+  "$python" "$app" --set-port "$port" >/dev/null
+fi
+URL="http://127.0.0.1:$port"
+note "$URL (change it later in Settings > Server)"
+
+step "Setting up the login item"
 brew_bin="$(brew --prefix)/bin"
 agent_path="$brew_bin"
 for directory in /usr/local/bin /usr/bin /bin; do
@@ -150,7 +186,7 @@ curl -fsS -o /dev/null --max-time 2 "$URL" 2>/dev/null || { tail -20 "$LOG" >&2 
 
 step "Adding gh aliases"
 gh alias set --clobber pr-overview "!$app_dir/github-pr-overview.sh" >/dev/null
-gh alias set --clobber pr-overview-web "!open $URL" >/dev/null
+gh alias set --clobber pr-overview-web "!open \"http://127.0.0.1:\$('$python' '$app' --show-port)\"" >/dev/null
 note "gh pr-overview prints your PRs in the terminal; gh pr-overview-web opens the board"
 
 step "Done"

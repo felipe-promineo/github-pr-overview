@@ -19,6 +19,7 @@ Everything runs on your machine with your own `gh` login, and the page is served
 
 The cog button in the top banner opens a page where you can change:
 
+- the port the board is served on (**Server**): after saving, the board restarts on the new port and the page follows it; a port that's in use is refused and the board stays where it is
 - whether empty columns collapse into a thin bar
 - the refresh interval, or turn auto-refresh off so the board (and notifications) only update when you reload the page
 - whether notifications show, and their sound (any macOS system sound, or none; **Play** previews it)
@@ -66,9 +67,10 @@ Or from a clone: `./install.sh`. The installer:
 1. installs what's missing with Homebrew: `gh`, `terminal-notifier`, `git` and Python 3.8 or newer
 2. runs `gh auth login` if `gh` isn't logged in yet
 3. clones the app into `~/Repositories/github-pr-overview` (`--dir PATH` for another place; run from a clone, it uses that clone), or updates an existing clone
-4. writes `~/Library/LaunchAgents/github-pr-overview.plist` with the right paths and loads it, so the board runs now and starts at login (and restarts if it stops)
-5. adds the `gh pr-overview` (terminal list) and `gh pr-overview-web` (opens the board) aliases
-6. opens http://127.0.0.1:8765 (`--no-browser` to skip)
+4. picks the port: the one in the settings (8765 at first), or the next free one when that is in use, which it then saves (`--port PORT` to choose it yourself)
+5. writes `~/Library/LaunchAgents/github-pr-overview.plist` with the right paths and loads it, so the board runs now and starts at login (and restarts if it stops)
+6. adds the `gh pr-overview` (terminal list) and `gh pr-overview-web` (opens the board on whatever port it uses) aliases
+7. opens the board (`--no-browser` to skip)
 
 At the end it lists the orgs the `gh` token can see. If an org's repositories don't show up in **Tracked repositories**, it probably uses SSO: run `gh auth refresh` and authorize the token for it at https://github.com/settings/tokens.
 
@@ -86,6 +88,6 @@ Requirements: macOS (notifications use `terminal-notifier` and `afplay`), Python
 python3 github-pr-overview.py
 ```
 
-This serves the page on http://127.0.0.1:8765 and opens it in your browser. Pass `--no-browser` to only start the server. `github-pr-overview.sh` prints the same overview (without the review column) in the terminal.
+This serves the page on http://127.0.0.1:8765 and opens it in your browser. Pass `--no-browser` to only start the server. `--show-port` prints the port it uses, and `--set-port PORT` saves another one (it takes effect when the server next starts). `github-pr-overview.sh` prints the same overview (without the review column) in the terminal.
 
 To start it at login by hand, copy `github-pr-overview.plist` to `~/Library/LaunchAgents/`, replace `/path/to/github-pr-overview` with the path to your clone, check the `python3` path (`which python3`), and load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/github-pr-overview.plist`. After pulling changes, restart it with `launchctl kickstart -k gui/$(id -u)/github-pr-overview`.

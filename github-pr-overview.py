@@ -2,6 +2,7 @@ import html
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -12,10 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-PORT = 8765
+DEFAULT_PORT = 8765
 FRESH_SECONDS = 15
-ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
-ALLOWED_ORIGINS = {f"http://{host}" for host in ALLOWED_HOSTS}
 SETTINGS_PATH = Path.home() / ".config" / "github-pr-overview" / "settings.json"
 REPOSITORIES_PATH = SETTINGS_PATH.with_name("repositories.json")
 SOUNDS_DIRECTORY = Path("/System/Library/Sounds")
@@ -110,6 +109,7 @@ OLD_RULE_PRIORITIES = {"draft": 1, "needs_action": 2, "approved": 3, "waiting": 
 OLD_RULE_QUALIFIERS = {"draft": "draft:true", "approved": "review:approved"}
 
 DEFAULT_SETTINGS = {
+    "port": DEFAULT_PORT,
     "collapse_empty_sections": True,
     "auto_refresh": True,
     "refresh_minutes": 2,
@@ -207,11 +207,16 @@ def is_per_repo(value):
     return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_PER_REPO
 
 
+def is_port(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 1024 <= value <= 65535
+
+
 def is_sound(value):
     return isinstance(value, str) and (value == "" or value in available_sounds())
 
 
 VALIDATORS = {
+    "port": is_port,
     "collapse_empty_sections": is_bool,
     "auto_refresh": is_bool,
     "refresh_minutes": is_minutes,
@@ -353,6 +358,20 @@ def load_settings():
         return normalized_settings({})
 
 
+def port_is_free(port):
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def board_url(port):
+    return f"http://127.0.0.1:{port}"
+
+
 def save_settings(settings):
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = SETTINGS_PATH.with_suffix(".tmp")
@@ -401,6 +420,7 @@ def settings_from_form(form):
 
     rule_indices = sorted(int(match.group(1)) for key in form if (match := re.fullmatch(r"rule(\d+)_id", key)))
     return normalized_settings({
+        "port": number("port"),
         "collapse_empty_sections": checked("collapse_empty_sections"),
         "auto_refresh": checked("auto_refresh"),
         "refresh_minutes": number("refresh_minutes"),
@@ -853,6 +873,7 @@ STYLE = """
          border-radius: 10px; color: var(--accent); border: 1px solid var(--accent); }
   .error { background: #161b22; border: 1px solid #f85149; border-radius: 8px; padding: 12px; white-space: pre-wrap; }
   .notice { color: #3fb950; }
+  .notice.warning { color: #d29922; }
   fieldset { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; margin: 0 0 16px; }
   legend { padding: 0 6px; font-weight: 600; }
   fieldset > label, fieldset > p { display: block; margin: 8px 0; }
@@ -1407,7 +1428,25 @@ def settings_script(rules):
     )
 
 
-def render_settings(overview, saved):
+def render_moving(port):
+    url = board_url(port)
+    content = f"""<h1>Moving to port {port}</h1>
+<p>The board is restarting on <a href="{url}/settings?saved">{url}</a>. This page follows it when it's up.</p>
+<script>
+async function follow() {{
+  try {{
+    await fetch('{url}/', {{mode: 'no-cors', cache: 'no-store'}});
+    location.href = '{url}/settings?saved';
+  }} catch (error) {{
+    setTimeout(follow, 300);
+  }}
+}}
+setTimeout(follow, 300);
+</script>"""
+    return page("Moving · GitHub PR overview", "", content)
+
+
+def render_settings(overview, saved, port_in_use):
     settings = overview.settings
     sound_options = "".join(
         f'<option value="{html.escape(value)}"{" selected" if value == settings["sound"] else ""}>{html.escape(label)}</option>'
@@ -1418,6 +1457,11 @@ def render_settings(overview, saved):
     rows = "".join(section_fields("section", index, section, rules) for index, section in enumerate(settings["sections"]))
     tracked_rows = "".join(section_fields("tracked", index, section, rules) for index, section in enumerate(settings["tracked_sections"]))
     notice = '<span class="notice">Saved</span>' if saved else ""
+    if port_in_use:
+        notice = (
+            f'<span class="notice warning">Saved, but port {html.escape(port_in_use)} is in use, '
+            f'so the board stays on port {settings["port"]}</span>'
+        )
     content = f"""<h1>Settings</h1>
 <form method="post" action="/settings">
   <fieldset>
@@ -1426,6 +1470,13 @@ def render_settings(overview, saved):
     <label><input type="checkbox" name="auto_refresh"{checked_attribute(settings['auto_refresh'])}> Refresh every
       <input type="number" name="refresh_minutes" min="1" value="{settings['refresh_minutes']}"> minutes</label>
     <p class="hint">When refresh is off, the board and notifications only update when you reload the page.</p>
+  </fieldset>
+  <fieldset>
+    <legend>Server</legend>
+    <label>Port <input type="number" name="port" min="1024" max="65535" value="{settings['port']}" style="width: 6em"></label>
+    <p class="hint">The board is served on http://127.0.0.1:<em>port</em>. When you change it, the board restarts there and this page follows;
+      the old address and its bookmarks stop working, while <code>gh pr-overview-web</code> follows the change.
+      Collapsed sections are remembered per address, so they start over on the new port.</p>
   </fieldset>
   <fieldset>
     <legend>Notifications</legend>
@@ -1490,7 +1541,7 @@ def render_settings(overview, saved):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.headers.get("Host") not in ALLOWED_HOSTS:
+        if self.headers.get("Host") not in self.server.allowed_hosts:
             self.send_error(403)
             return
         url = urlsplit(self.path)
@@ -1502,7 +1553,8 @@ class Handler(BaseHTTPRequestHandler):
             max_age = int(max_age) if max_age.isdigit() else FRESH_SECONDS
             self.respond(board_content(overview.fresh_board(max_age)))
         elif url.path == "/settings":
-            self.respond(render_settings(overview, "saved" in parse_qs(url.query)))
+            query = parse_qs(url.query)
+            self.respond(render_settings(overview, "saved" in query, query.get("port_in_use", [""])[0]))
         elif url.path == "/repositories":
             try:
                 self.respond(repository_groups(overview.repositories("reload" in parse_qs(url.query))))
@@ -1515,7 +1567,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         origin = self.headers.get("Origin")
-        if self.headers.get("Host") not in ALLOWED_HOSTS or (origin is not None and origin not in ALLOWED_ORIGINS):
+        allowed_origins = {f"http://{host}" for host in self.server.allowed_hosts}
+        if self.headers.get("Host") not in self.server.allowed_hosts or (origin is not None and origin not in allowed_origins):
             self.send_error(403)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1523,21 +1576,31 @@ class Handler(BaseHTTPRequestHandler):
         overview = self.server.overview
         path = urlsplit(self.path).path
         if path == "/settings":
-            settings = settings_from_form(form)
-            save_settings(settings)
-            overview.change_settings(settings)
-            self.redirect("/settings?saved")
+            self.apply_settings(settings_from_form(form))
         elif path == "/settings/reset":
-            settings = normalized_settings({})
-            save_settings(settings)
-            overview.change_settings(settings)
-            self.redirect("/settings?saved")
+            self.apply_settings(normalized_settings({}))
         elif path == "/settings/sound":
             play_sound(form.get("sound", [""])[0])
             self.send_response(204)
             self.end_headers()
         else:
             self.send_error(404)
+
+    def apply_settings(self, settings):
+        running_port = self.server.server_port
+        wanted_port = settings["port"]
+        if wanted_port != running_port and not port_is_free(wanted_port):
+            settings["port"] = running_port
+        save_settings(settings)
+        self.server.overview.change_settings(settings)
+        if settings["port"] != running_port:
+            self.respond(render_moving(settings["port"]))
+            self.server.restart = True
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+        elif wanted_port != running_port:
+            self.redirect(f"/settings?saved&port_in_use={wanted_port}")
+        else:
+            self.redirect("/settings?saved")
 
     def respond(self, text, status=200):
         body = text.encode()
@@ -1557,16 +1620,60 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-if __name__ == "__main__":
-    overview = Overview(load_settings(), Notifier())
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+USAGE = """Usage: github-pr-overview.py [--no-browser] [--show-port] [--set-port PORT]
+
+  (no option)      serve the board and open it in the browser
+  --no-browser     serve the board without opening it
+  --show-port      print the port the board uses, then exit
+  --set-port PORT  save PORT (1024-65535) as the port to use, then exit;
+                   a running board keeps its port until it restarts"""
+
+
+def set_port(value):
+    port = int(value) if value.isdigit() else None
+    if not is_port(port):
+        sys.exit(f"Not a port between 1024 and 65535: {value}")
+    settings = load_settings()
+    settings["port"] = port
+    save_settings(settings)
+    print(f"Saved port {port}")
+
+
+def serve(open_browser):
+    settings = load_settings()
+    port = settings["port"]
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as error:
+        sys.exit(f"Can't serve on port {port}: {error.strerror}. Pick another one with --set-port PORT.")
+    overview = Overview(settings, Notifier())
     server.overview = overview
-    url = f"http://127.0.0.1:{PORT}"
-    print(f"Serving {url} (Ctrl+C to stop)")
+    server.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    server.restart = False
+    url = board_url(port)
+    print(f"Serving {url} (Ctrl+C to stop)", flush=True)
     threading.Thread(target=overview.watch, daemon=True).start()
-    if "--no-browser" not in sys.argv:
+    if open_browser:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    server.server_close()
+    if server.restart:
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "--no-browser"])
+
+
+if __name__ == "__main__":
+    arguments = sys.argv[1:]
+    if "-h" in arguments or "--help" in arguments:
+        print(USAGE)
+    elif "--show-port" in arguments:
+        print(load_settings()["port"])
+    elif "--set-port" in arguments:
+        position = arguments.index("--set-port")
+        if position + 1 >= len(arguments):
+            sys.exit("--set-port needs a port")
+        set_port(arguments[position + 1])
+    else:
+        serve("--no-browser" not in arguments)
