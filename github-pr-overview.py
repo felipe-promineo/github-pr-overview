@@ -15,6 +15,9 @@ from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_PORT = 8765
 FRESH_SECONDS = 15
+UPDATE_CHECK_SECONDS = 60 * 60
+APP_DIRECTORY = Path(__file__).resolve().parent
+GITHUB_REMOTE = re.compile(r"(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?")
 SETTINGS_PATH = Path.home() / ".config" / "github-pr-overview" / "settings.json"
 REPOSITORIES_PATH = SETTINGS_PATH.with_name("repositories.json")
 SOUNDS_DIRECTORY = Path("/System/Library/Sounds")
@@ -113,6 +116,7 @@ DEFAULT_SETTINGS = {
     "collapse_empty_sections": True,
     "auto_refresh": True,
     "refresh_minutes": 2,
+    "auto_update": False,
     "notifications": True,
     "sound": "Glass",
     "first_match_only": True,
@@ -220,6 +224,7 @@ VALIDATORS = {
     "collapse_empty_sections": is_bool,
     "auto_refresh": is_bool,
     "refresh_minutes": is_minutes,
+    "auto_update": is_bool,
     "notifications": is_bool,
     "sound": is_sound,
     "first_match_only": is_bool,
@@ -424,6 +429,7 @@ def settings_from_form(form):
         "collapse_empty_sections": checked("collapse_empty_sections"),
         "auto_refresh": checked("auto_refresh"),
         "refresh_minutes": number("refresh_minutes"),
+        "auto_update": checked("auto_update"),
         "notifications": checked("notifications"),
         "sound": text("sound"),
         "first_match_only": checked("first_match_only"),
@@ -832,6 +838,101 @@ class Overview:
             self.settings_changed.clear()
 
 
+def run_git(*arguments):
+    return subprocess.run(
+        ["git", "-C", str(APP_DIRECTORY), *arguments],
+        capture_output=True, text=True, check=True, timeout=120,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    ).stdout.strip()
+
+
+def git_failure(error):
+    if isinstance(error, subprocess.CalledProcessError):
+        return (error.stderr or error.stdout or "").strip() or f"git exited with {error.returncode}"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "git took too long"
+    return "git isn't available"
+
+
+GIT_ERRORS = (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError)
+
+
+def commit_url(commit):
+    try:
+        match = GITHUB_REMOTE.fullmatch(run_git("remote", "get-url", "origin"))
+    except GIT_ERRORS:
+        return ""
+    return f"https://github.com/{match.group(1)}/commit/{commit}" if match else ""
+
+
+def current_version():
+    try:
+        commit = run_git("rev-parse", "HEAD")
+        subject = run_git("log", "-1", "--format=%s")
+    except GIT_ERRORS:
+        return None
+    return {"commit": commit, "short": commit[:7], "subject": subject, "url": commit_url(commit)}
+
+
+class Updater:
+    def __init__(self, overview, restart):
+        self.overview = overview
+        self.restart = restart
+        self.version = current_version()
+        self.pending = 0
+        self.checked_at = None
+        self.error = None
+        self.wake = threading.Event()
+        self._lock = threading.Lock()
+
+    def check(self):
+        if self.version is None:
+            return 0
+        with self._lock:
+            try:
+                run_git("fetch", "--quiet", "origin")
+                self.pending = int(run_git("rev-list", "--count", "HEAD..@{upstream}"))
+                self.error = None
+            except GIT_ERRORS as error:
+                self.error = git_failure(error)
+            except ValueError:
+                self.error = "Unexpected answer from git"
+            self.checked_at = time.time()
+            return self.pending
+
+    def install(self):
+        with self._lock:
+            try:
+                run_git("pull", "--ff-only", "--quiet")
+                commit = run_git("rev-parse", "HEAD")
+            except GIT_ERRORS as error:
+                self.error = git_failure(error)
+                return None
+            self.error = None
+            self.pending = 0
+            return commit
+
+    def install_and_restart(self):
+        commit = self.install()
+        if commit is not None and commit != self.version["commit"]:
+            self.restart()
+        return commit
+
+    def watch(self):
+        if self.version is None:
+            return
+        while True:
+            if self.check() and self.overview.settings["auto_update"]:
+                self.install_and_restart()
+            self.wake.wait(UPDATE_CHECK_SECONDS)
+            self.wake.clear()
+
+
+def restart_server(server):
+    server.restart = True
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+
 STYLE = """
   body { margin: 0; background: #0d1117; color: #e6edf3;
          font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -918,6 +1019,14 @@ STYLE = """
   .badge.private { color: #d29922; border-color: #d29922; }
   .badge.missing { color: #f85149; border-color: #f85149; }
   .repo-option[hidden], .repo-group[hidden] { display: none; }
+  .title-block { display: flex; gap: 10px; align-items: center; }
+  .version { color: #8b949e; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; text-decoration: none; }
+  .version:hover { color: #e6edf3; text-decoration: underline; }
+  .update-form { display: inline-flex; margin: 0; }
+  .update-form[hidden] { display: none; }
+  .update-button { display: inline-flex; padding: 2px; border: none; background: none; color: #3fb950; }
+  .update-button svg { width: 16px; height: 16px; fill: currentColor; }
+  .update-button:hover { color: #56d364; }
 """
 
 ICON = (
@@ -959,7 +1068,34 @@ BACK_ICON = (
 )
 
 
-def banner(settings, viewer, on_settings):
+UPDATE_ICON = (
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm.53 4.22a.75.75 0 0 0-1.06 0'
+    'L4.72 6.97a.75.75 0 0 0 1.06 1.06l1.47-1.47v4.69a.75.75 0 0 0 1.5 0V6.56l1.47 1.47a.75.75 0 1 0 1.06-1.06Z"/></svg>'
+)
+
+
+def update_title(pending):
+    return f"{pending} new commit{'s' if pending != 1 else ''} on GitHub. Click to update and restart the board."
+
+
+def version_badge(updater):
+    version = updater.version
+    if version is None:
+        return ""
+    label = html.escape(version["short"])
+    title = html.escape(version["subject"], quote=True)
+    if version["url"]:
+        badge = f'<a class="version" href="{html.escape(version["url"])}" target="_blank" title="{title}">{label}</a>'
+    else:
+        badge = f'<span class="version" title="{title}">{label}</span>'
+    hidden = "" if updater.pending else " hidden"
+    return f"""{badge}
+    <form class="update-form" id="update-form" method="post" action="/update"{hidden}>
+      <button class="update-button" type="submit" title="{html.escape(update_title(updater.pending))}" aria-label="Update">{UPDATE_ICON}</button>
+    </form>"""
+
+
+def banner(settings, viewer, on_settings, updater):
     if viewer:
         account = f'<a class="account" href="{html.escape(viewer["url"])}" target="_blank">@{html.escape(viewer["login"])}</a>'
     else:
@@ -969,7 +1105,10 @@ def banner(settings, viewer, on_settings):
     else:
         button = f'<a class="button icon" href="/settings" title="Settings" aria-label="Settings">{GEAR_ICON}</a>'
     return f"""<header class="banner">
-  <h1><a href="/">GitHub PR overview</a></h1>
+  <div class="title-block">
+    <h1><a href="/">GitHub PR overview</a></h1>
+    {version_badge(updater)}
+  </div>
   <div class="meta">
     <span class="hint" id="status"></span>
     <span class="hint">{refresh_hint(settings)}</span>
@@ -1044,10 +1183,24 @@ def board_content(board):
 <div class="row"><h2 class="row-title">Tracked repositories <span class="hint">{count} repo{'s' if count != 1 else ''}</span></h2>{errors}{tracked}</div>"""
 
 
-def board_script(settings):
+def board_script(settings, updater):
     interval = settings["refresh_minutes"] * 60 if settings["auto_refresh"] else 0
+    commit = json.dumps(updater.version["commit"] if updater.version else "")
     return f"""
 const board = document.querySelector('main');
+const PAGE_COMMIT = {commit};
+function applyVersion(response) {{
+  const commit = response.headers.get('X-App-Commit') || '';
+  if (commit && PAGE_COMMIT && commit !== PAGE_COMMIT) {{
+    location.reload();
+    return;
+  }}
+  const form = document.getElementById('update-form');
+  if (!form) return;
+  const pending = Number(response.headers.get('X-App-Updates') || 0);
+  form.hidden = !pending;
+  form.querySelector('button').title = response.headers.get('X-App-Update-Title') || '';
+}}
 const status = document.getElementById('status');
 const COLLAPSE_KEY = 'collapsed-sections';
 function collapseChoices() {{
@@ -1075,6 +1228,7 @@ async function loadBoard(maxAge) {{
   status.textContent = 'Updating…';
   try {{
     const response = await fetch('/board?max_age=' + maxAge);
+    applyVersion(response);
     if (response.ok) {{
       board.innerHTML = await response.text();
       applyCollapseChoices();
@@ -1089,12 +1243,12 @@ if ({interval}) setInterval(() => loadBoard({interval}), {interval} * 1000);
 """
 
 
-def render_board(overview):
+def render_board(overview, updater):
     settings = overview.settings
     board = overview.cached_board()
     content = board_content(board) if board is not None else '<p class="hint">Loading pull requests…</p>'
-    content = f"<main>{content}</main>\n<script>{board_script(settings)}</script>"
-    return page("GitHub PR overview", banner(settings, overview.viewer, False), content)
+    content = f"<main>{content}</main>\n<script>{board_script(settings, updater)}</script>"
+    return page("GitHub PR overview", banner(settings, overview.viewer, False, updater), content)
 
 
 def option_list(options, selected):
@@ -1366,7 +1520,7 @@ rulesBox.addEventListener('change', event => {
 rulesBox.addEventListener('input', updateRules);
 updateRules();
 
-document.querySelector('form').addEventListener('submit', () => {
+document.getElementById('settings-form').addEventListener('submit', () => {
   for (const [box, field] of [['.sections', 'section_order'], ['.tracked-sections', 'tracked_order']]) {
     const order = [...document.querySelectorAll(box + ' .section-card')].map(card => card.dataset.index);
     document.querySelector('[name=' + field + ']').value = order.join(',');
@@ -1422,7 +1576,7 @@ async function loadRepositories(reload) {
 repoFilter.addEventListener('input', filterRepositories);
 loadRepositories(false);
 
-const settingsForm = document.querySelector('form');
+const settingsForm = document.getElementById('settings-form');
 const leaveDialog = document.getElementById('leave-dialog');
 function formState() {
   return JSON.stringify([...new FormData(settingsForm)].filter(([name]) => name !== 'next'));
@@ -1459,6 +1613,25 @@ document.getElementById('leave-discard').addEventListener('click', () => {
   location.href = destination;
 });
 document.getElementById('leave-stay').addEventListener('click', () => leaveDialog.close());
+
+const checkUpdates = document.getElementById('check-updates');
+checkUpdates.addEventListener('click', async () => {
+  const updateStatus = document.getElementById('update-status');
+  checkUpdates.disabled = true;
+  updateStatus.textContent = 'Checking…';
+  try {
+    const response = await fetch('/update/check', {method: 'POST'});
+    updateStatus.textContent = await response.text();
+    const form = document.getElementById('update-form');
+    if (form) {
+      form.hidden = !Number(response.headers.get('X-App-Updates') || 0);
+      form.querySelector('button').title = response.headers.get('X-App-Update-Title') || '';
+    }
+  } catch (error) {
+    updateStatus.textContent = 'Check failed';
+  }
+  checkUpdates.disabled = false;
+});
 """
 
 
@@ -1476,6 +1649,42 @@ def local_path(value):
     if value.startswith("/") and not value.startswith("//") and "\\" not in value and not parts.scheme and not parts.netloc:
         return value
     return ""
+
+
+def render_updating(commit, next_path):
+    target = json.dumps(next_path or "/").replace("</", "<\\/")
+    expected = json.dumps(commit)
+    content = f"""<h1>Updating</h1>
+<p>The board updated to <code>{html.escape(commit[:7])}</code> and is restarting. This page goes back when it's up.</p>
+<script>
+async function follow() {{
+  try {{
+    const response = await fetch('/version', {{cache: 'no-store'}});
+    if (response.ok && (await response.text()) === {expected}) {{
+      location.href = {target};
+      return;
+    }}
+  }} catch (error) {{
+  }}
+  setTimeout(follow, 300);
+}}
+setTimeout(follow, 300);
+</script>"""
+    return page("Updating · GitHub PR overview", "", content)
+
+
+def update_status(updater):
+    if updater.version is None:
+        return "Updates need the board to run from a git clone."
+    parts = []
+    if updater.checked_at is not None:
+        parts.append(f"Last checked at {time.strftime('%H:%M', time.localtime(updater.checked_at))}")
+    if updater.error:
+        parts.append(f"git failed: {updater.error}")
+    elif updater.checked_at is not None:
+        pending = updater.pending
+        parts.append(f"{pending} new commit{'s' if pending != 1 else ''} waiting; click the green arrow to install" if pending else "Up to date")
+    return ". ".join(parts)
 
 
 def render_moving(port, next_path):
@@ -1497,7 +1706,16 @@ setTimeout(follow, 300);
     return page("Moving · GitHub PR overview", "", content)
 
 
-def render_settings(overview, saved, port_in_use):
+def version_line(updater):
+    version = updater.version
+    if version is None:
+        return "an unknown version"
+    short = html.escape(version["short"])
+    commit = f'<a href="{html.escape(version["url"])}" target="_blank"><code>{short}</code></a>' if version["url"] else f"<code>{short}</code>"
+    return f'{commit} <span class="hint">{html.escape(version["subject"])}</span>'
+
+
+def render_settings(overview, updater, saved, port_in_use):
     settings = overview.settings
     sound_options = "".join(
         f'<option value="{html.escape(value)}"{" selected" if value == settings["sound"] else ""}>{html.escape(label)}</option>'
@@ -1514,13 +1732,23 @@ def render_settings(overview, saved, port_in_use):
             f'so the board stays on port {settings["port"]}</span>'
         )
     content = f"""<h1>Settings</h1>
-<form method="post" action="/settings">
+<form id="settings-form" method="post" action="/settings">
   <fieldset>
     <legend>Board</legend>
     <label><input type="checkbox" name="collapse_empty_sections"{checked_attribute(settings['collapse_empty_sections'])}> Collapse empty sections</label>
     <label><input type="checkbox" name="auto_refresh"{checked_attribute(settings['auto_refresh'])}> Refresh every
       <input type="number" name="refresh_minutes" min="1" value="{settings['refresh_minutes']}"> minutes</label>
     <p class="hint">When refresh is off, the board and notifications only update when you reload the page.</p>
+  </fieldset>
+  <fieldset>
+    <legend>Updates</legend>
+    <p>Running {version_line(updater)}</p>
+    <label><input type="checkbox" name="auto_update"{checked_attribute(settings['auto_update'])}> Install updates automatically and restart the board</label>
+    <p class="hint">The board looks for new commits on GitHub when it starts and then once an hour, with a <code>git fetch</code> in the background,
+      never on page refreshes. A green arrow next to the version in the banner means an update is waiting; click it to install it.
+      Updates only fast-forward: local changes or commits that conflict stop them, and the error shows here.</p>
+    <p class="actions"><button type="button" id="check-updates"{" disabled" if updater.version is None else ""}>Check now</button>
+      <span class="hint" id="update-status">{html.escape(update_status(updater))}</span></p>
   </fieldset>
   <fieldset>
     <legend>Server</legend>
@@ -1597,7 +1825,7 @@ def render_settings(overview, saved, port_in_use):
   </div>
 </dialog>
 <script>{settings_script(rules)}</script>"""
-    return page("Settings · GitHub PR overview", banner(settings, overview.current_viewer(), True), content)
+    return page("Settings · GitHub PR overview", banner(settings, overview.current_viewer(), True, updater), content)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1607,15 +1835,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         overview = self.server.overview
+        updater = self.server.updater
         if url.path == "/":
-            self.respond(render_board(overview))
+            self.respond(render_board(overview, updater))
         elif url.path == "/board":
             max_age = parse_qs(url.query).get("max_age", [""])[0]
             max_age = int(max_age) if max_age.isdigit() else FRESH_SECONDS
-            self.respond(board_content(overview.fresh_board(max_age)))
+            self.respond(board_content(overview.fresh_board(max_age)), headers=self.update_headers())
+        elif url.path == "/version":
+            self.respond(updater.version["commit"] if updater.version else "", content_type="text/plain")
         elif url.path == "/settings":
             query = parse_qs(url.query, keep_blank_values=True)
-            self.respond(render_settings(overview, "saved" in query, query.get("port_in_use", [""])[0]))
+            self.respond(render_settings(overview, updater, "saved" in query, query.get("port_in_use", [""])[0]))
         elif url.path == "/repositories":
             try:
                 self.respond(repository_groups(overview.repositories("reload" in parse_qs(url.query))))
@@ -1640,6 +1871,11 @@ class Handler(BaseHTTPRequestHandler):
             self.apply_settings(settings_from_form(form), local_path(form.get("next", [""])[0]))
         elif path == "/settings/reset":
             self.apply_settings(normalized_settings({}), "")
+        elif path == "/update":
+            self.install_update(local_path(form.get("next", [""])[0]))
+        elif path == "/update/check":
+            self.server.updater.check()
+            self.respond(update_status(self.server.updater), content_type="text/plain", headers=self.update_headers())
         elif path == "/settings/sound":
             play_sound(form.get("sound", [""])[0])
             self.send_response(204)
@@ -1647,7 +1883,36 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def update_headers(self):
+        updater = self.server.updater
+        if updater.version is None:
+            return {}
+        return {
+            "X-App-Commit": updater.version["commit"],
+            "X-App-Updates": str(updater.pending),
+            "X-App-Update-Title": update_title(updater.pending),
+        }
+
+    def install_update(self, next_path):
+        updater = self.server.updater
+        if updater.version is None:
+            self.send_error(404)
+            return
+        commit = updater.install()
+        if commit is None:
+            self.respond(page("Update failed · GitHub PR overview", "", f"""<h1>Update failed</h1>
+<pre class="error">{html.escape(updater.error or "")}</pre>
+<p><a href="/">Back to the board</a></p>"""), 500)
+        elif commit == updater.version["commit"]:
+            self.redirect(next_path or "/")
+        else:
+            self.respond(render_updating(commit, next_path or local_path(urlsplit(self.headers.get("Referer", "")).path)))
+            restart_server(self.server)
+
     def apply_settings(self, settings, next_path):
+        previous = self.server.overview.settings
+        if settings["auto_update"] and not previous["auto_update"]:
+            self.server.updater.wake.set()
         running_port = self.server.server_port
         wanted_port = settings["port"]
         if wanted_port != running_port and not port_is_free(wanted_port):
@@ -1656,17 +1921,18 @@ class Handler(BaseHTTPRequestHandler):
         self.server.overview.change_settings(settings)
         if settings["port"] != running_port:
             self.respond(render_moving(settings["port"], next_path))
-            self.server.restart = True
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            restart_server(self.server)
         elif wanted_port != running_port:
             self.redirect(f"/settings?saved&port_in_use={wanted_port}")
         else:
             self.redirect(next_path or "/settings?saved")
 
-    def respond(self, text, status=200):
+    def respond(self, text, status=200, content_type="text/html", headers=None):
         body = text.encode()
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1709,11 +1975,14 @@ def serve(open_browser):
         sys.exit(f"Can't serve on port {port}: {error.strerror}. Pick another one with --set-port PORT.")
     overview = Overview(settings, Notifier())
     server.overview = overview
+    updater = Updater(overview, lambda: restart_server(server))
+    server.updater = updater
     server.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     server.restart = False
     url = board_url(port)
     print(f"Serving {url} (Ctrl+C to stop)", flush=True)
     threading.Thread(target=overview.watch, daemon=True).start()
+    threading.Thread(target=updater.watch, daemon=True).start()
     if open_browser:
         webbrowser.open(url)
     try:

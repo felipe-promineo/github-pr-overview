@@ -11,6 +11,7 @@ A local web page that shows your GitHub pull requests as a board and sends a mac
 - [Settings](#settings)
   - [Sections and rules](#sections-and-rules)
   - [Tracked repositories](#tracked-repositories)
+- [Updates](#updates)
 - [Command line](#command-line)
 - [Manual setup](#manual-setup)
 - [Files](#files)
@@ -40,7 +41,7 @@ Or run `./install.sh` from a clone. The installer:
 | `--no-browser` | don't open the board at the end |
 | `--uninstall` | remove the login item and aliases (keeps the clone and settings) |
 
-**Update** by running the installer again. If an org's repositories are missing, it probably uses SSO: run `gh auth refresh` and authorize the token for it at https://github.com/settings/tokens.
+**Update** from the board (see [Updates](#updates)) or by running the installer again. If an org's repositories are missing, it probably uses SSO: run `gh auth refresh` and authorize the token for it at https://github.com/settings/tokens.
 
 ## The board
 
@@ -62,6 +63,7 @@ The board refreshes every 2 minutes. A PR that newly lands in **Needs action**, 
 The cog button opens the settings page:
 
 - **Board**: collapse empty columns, refresh interval (or off)
+- **Updates**: the running version, auto-update on or off, and **Check now**
 - **Server**: the port; after saving, the board restarts there and the page follows (a port in use is refused)
 - **Notifications**: on or off, and the sound
 - **Sections**, **Rules**, **Tracked repositories**: see below
@@ -94,6 +96,12 @@ With **Show each PR only in one section** on (the default), a PR matching severa
 A second row can show the PRs of repositories you pick, in any state. The picker lists every repository the `gh` account can see, grouped into personal public, personal private, each org, and collaborations. Filter it, check the ones to track, and use **Reload list** after joining an org.
 
 Each repository contributes its most recently updated PRs (20 by default). They go into shared sections that work like the ones above, without a query: Merged, Closed, Draft, Needs action, Ready for merge, Ready for review and Open. **Hide PRs that already show in the My PRs row** is on by default. A repository that fails to load shows an error; the others still load.
+
+## Updates
+
+The banner shows the commit the board runs, linked to it on GitHub. The board runs `git fetch` in the background when it starts and then once an hour (never on page refreshes); when its branch has new commits, a green arrow appears next to the commit. Click it to fast-forward the clone and restart the board; open pages reload on their own.
+
+Turn on **Install updates automatically** in Settings → Updates to do that without clicking. Updates only fast-forward, so local changes or commits that conflict stop them and the error shows in the settings. A copy that isn't a git clone shows no version and doesn't update.
 
 ## Command line
 
