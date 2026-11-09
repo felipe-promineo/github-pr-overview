@@ -1035,6 +1035,8 @@ STYLE = """
   .banner h1 { font-size: 18px; margin: 0; }
   .banner h1 a { color: inherit; text-decoration: none; }
   .content { padding: 24px; }
+  .settings { padding: 0 15%; }
+  @media (max-width: 900px) { .settings { padding: 0; } }
   h1 { font-size: 20px; margin: 0 0 16px; }
   .hint { color: #8b949e; font-size: 12px; }
   .meta { display: flex; gap: 16px; align-items: center; }
@@ -1848,7 +1850,8 @@ def render_settings(overview, updater, saved, port_in_use):
             f'<span class="notice warning">Saved, but port {html.escape(port_in_use)} is in use, '
             f'so the board stays on port {settings["port"]}</span>'
         )
-    content = f"""<h1>Settings</h1>
+    content = f"""<div class="settings">
+<h1>Settings</h1>
 <form id="settings-form" method="post" action="/settings">
   <fieldset>
     <legend>Board</legend>
@@ -1946,6 +1949,7 @@ def render_settings(overview, updater, saved, port_in_use):
     <button type="button" id="leave-save" class="primary">Save and leave</button>
   </div>
 </dialog>
+</div>
 <script>{settings_script(rules)}</script>"""
     return page("Settings · GitHub PR overview", banner(settings, overview.current_viewer(), True, updater), content)
 
