@@ -5,12 +5,14 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 PORT = 8765
+FRESH_SECONDS = 15
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 ALLOWED_ORIGINS = {f"http://{host}" for host in ALLOWED_HOSTS}
 SETTINGS_PATH = Path.home() / ".config" / "github-pr-overview" / "settings.json"
@@ -520,18 +522,36 @@ class Overview:
         self.notifier = notifier
         self.settings_changed = threading.Event()
         self.viewer = None
+        self.board = None
+        self._refresh_lock = threading.Lock()
 
     def change_settings(self, settings):
         self.settings = settings
         self.settings_changed.set()
 
-    def load_board(self):
-        settings = self.settings
-        data = fetch_pull_requests(settings["sections"])
-        groups = group_pull_requests(data, settings)
-        self.notifier.update(groups, settings)
-        self.viewer = data["viewer"]
-        return data["viewer"], groups
+    def cached_board(self):
+        board = self.board
+        return board if board is not None and board["settings"] is self.settings else None
+
+    def fresh_board(self, max_age):
+        with self._refresh_lock:
+            board = self.cached_board()
+            if board is not None and time.monotonic() - board["loaded_at"] <= max_age:
+                return board
+            settings = self.settings
+            board = {"settings": settings, "groups": None, "error": None, "loaded_at": time.monotonic()}
+            try:
+                data = fetch_pull_requests(settings["sections"])
+                board["groups"] = group_pull_requests(data, settings)
+                self.viewer = data["viewer"]
+            except subprocess.CalledProcessError as error:
+                board["error"] = error.stderr
+            except (KeyError, ValueError) as error:
+                board["error"] = f"Unexpected response from gh: {error!r}"
+            if board["groups"] is not None:
+                self.notifier.update(board["groups"], settings)
+            self.board = board
+            return board
 
     def current_viewer(self):
         if self.viewer is None:
@@ -546,10 +566,7 @@ class Overview:
             settings = self.settings
             timeout = None
             if settings["auto_refresh"]:
-                try:
-                    self.load_board()
-                except (subprocess.CalledProcessError, KeyError, ValueError):
-                    pass
+                self.fresh_board(FRESH_SECONDS)
                 timeout = settings["refresh_minutes"] * 60
             self.settings_changed.wait(timeout)
             self.settings_changed.clear()
@@ -673,6 +690,7 @@ def banner(settings, viewer, on_settings):
     return f"""<header class="banner">
   <h1><a href="/">GitHub PR overview</a></h1>
   <div class="meta">
+    <span class="hint" id="status"></span>
     <span class="hint">{refresh_hint(settings)}</span>
     <span class="hint">gh account: {account}</span>
     {button}
@@ -680,14 +698,12 @@ def banner(settings, viewer, on_settings):
 </header>"""
 
 
-def page(title, banner_html, content, refresh_seconds=None):
-    refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
+def page(title, banner_html, content):
     body = f'{banner_html}\n<div class="content">\n{content}\n</div>'
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-{refresh}
 <title>{html.escape(title)}</title>
 <link rel="icon" href="{ICON}">
 <style>{STYLE}</style>
@@ -709,17 +725,12 @@ def refresh_hint(settings):
     return f"Refreshes every {minutes} minute{'s' if minutes != 1 else ''}, or reload the page"
 
 
-def render_board(overview):
-    settings = overview.settings
-    refresh_seconds = settings["refresh_minutes"] * 60 if settings["auto_refresh"] else None
-    try:
-        viewer, groups = overview.load_board()
-    except subprocess.CalledProcessError as error:
-        content = f'<pre class="error">gh failed:\n{html.escape(error.stderr)}</pre>'
-        return page("GitHub PR overview", banner(settings, None, False), content, refresh_seconds)
-
+def board_content(board):
+    if board["error"] is not None:
+        return f'<pre class="error">gh failed:\n{html.escape(board["error"])}</pre>'
+    settings = board["settings"]
     columns = []
-    for section, items in zip(settings["sections"], groups):
+    for section, items in zip(settings["sections"], board["groups"]):
         cards = "".join(
             f"""<a class="card" href="{html.escape(pr['url'])}" target="_blank">
                   <div class="repo">{html.escape(pr['repository']['nameWithOwner'])}#{pr['number']}</div>
@@ -735,9 +746,35 @@ def render_board(overview):
                   {cards}
                 </section>"""
         )
+    return "".join(columns)
 
-    content = f"<main>{''.join(columns)}</main>"
-    return page("GitHub PR overview", banner(settings, viewer, False), content, refresh_seconds)
+
+def board_script(settings):
+    interval = settings["refresh_minutes"] * 60 if settings["auto_refresh"] else 0
+    return f"""
+const board = document.querySelector('main');
+const status = document.getElementById('status');
+async function loadBoard(maxAge) {{
+  status.textContent = 'Updating…';
+  try {{
+    const response = await fetch('/board?max_age=' + maxAge);
+    if (response.ok) board.innerHTML = await response.text();
+    status.textContent = response.ok ? '' : 'Update failed';
+  }} catch (error) {{
+    status.textContent = 'Update failed';
+  }}
+}}
+loadBoard({FRESH_SECONDS});
+if ({interval}) setInterval(() => loadBoard({interval}), {interval} * 1000);
+"""
+
+
+def render_board(overview):
+    settings = overview.settings
+    board = overview.cached_board()
+    content = board_content(board) if board is not None else '<p class="hint">Loading pull requests…</p>'
+    content = f"<main>{content}</main>\n<script>{board_script(settings)}</script>"
+    return page("GitHub PR overview", banner(settings, overview.viewer, False), content)
 
 
 def option_list(options, selected):
@@ -1026,6 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
         overview = self.server.overview
         if url.path == "/":
             self.respond(render_board(overview))
+        elif url.path == "/board":
+            max_age = parse_qs(url.query).get("max_age", [""])[0]
+            max_age = int(max_age) if max_age.isdigit() else FRESH_SECONDS
+            self.respond(board_content(overview.fresh_board(max_age)))
         elif url.path == "/settings":
             self.respond(render_settings(overview, "saved" in parse_qs(url.query)))
         else:
