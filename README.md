@@ -17,12 +17,32 @@ Everything runs on your machine with your own `gh` login, and the page is served
 
 ## Settings
 
-The **Settings** link on the board opens a page where you can change:
+The cog button in the top banner opens a page where you can change:
 
 - whether empty columns collapse into a thin bar
 - the refresh interval, or turn auto-refresh off so the board (and notifications) only update when you reload the page
 - whether notifications show, and their sound (any macOS system sound, or none; **Play** previews it)
-- per column: title, color, the [GitHub search query](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests) it shows, the rule that filters the query's results (draft, no reviewer, waiting for reviewer, needs action, approved, or every PR), and whether it notifies
+- rules: named sets of conditions, reusable across columns
+- per column: title, color, whether it notifies, its position on the board (the arrows), its [GitHub search query](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests), and its rule
+
+A column shows the PRs its query finds that match its rule, or every PR the query finds when it has no rule. A rule matches a PR when **all** of its conditions hold, or, with **Match any**, when at least one does; a rule without conditions matches every PR. **Add rule** creates one, **Add condition** adds a condition to it, and several columns can use the same rule. Each condition shows what it checks, and each rule shows a one-line summary of its logic. The conditions:
+
+| Condition | Values | Checks |
+|---|---|---|
+| Draft | `yes` / `no` | the PR is marked as a draft |
+| Approved | `yes` / `no` | GitHub's review decision is Approved, following the repo's required reviews |
+| Changes requested | `yes` / `no` | a reviewer's latest review requests changes, and they haven't been asked to review again |
+| CI | `passing` / `failing` / `pending` / `none` | the combined result of the checks on the latest commit; `none` means it has no checks |
+| Merge conflicts | `yes` / `no` | GitHub reports the PR can't merge cleanly (`no` while GitHub is still checking) |
+| Reviewers requested | `yes` / `no` | at least one person or team is currently asked to review |
+| Review requested from me | `yes` / `no` | the gh account itself is asked to review; team requests don't count |
+| Author is me | `yes` / `no` | the gh account opened the PR |
+| Matches rule | a rule | the PR matches another rule |
+| Doesn't match rule | a rule | the PR doesn't match another rule |
+
+The last two let rules build on each other. For example, the default **Has a problem** rule matches any of changes requested, CI failing or merge conflicts, and a rule with *all* of "Draft: no" and "Matches rule: Has a problem" shows non-draft PRs that need action. A condition that would make rules use each other in a loop is dropped when you save.
+
+With **Show each PR only in one section** on (the default), a PR that matches several columns only shows in the one with the lowest **Priority** number. The defaults use that: Draft (1, query `draft:true`), Needs action (2, rule "Has a problem"), Ready for merge (3, query `review:approved`), Waiting for reviewer (4, rule "Reviewers requested"), and Ready for review (5, no rule) catching the rest. Use the query for whatever GitHub search can express, and rules for what it can't, such as merge conflicts, "asked to review again", or "any of" combinations. Turn it off to show a PR in every column it matches.
 
 **Reset to defaults** restores the board above. Settings are saved in `~/.config/github-pr-overview/settings.json`.
 
