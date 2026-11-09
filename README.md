@@ -25,12 +25,12 @@ Everything runs on your machine with your own `gh` login: the page is served on 
 ## Run it
 
 ```bash
-python3 myprs_app.py
+python3 github-pr-overview.py
 ```
 
 This serves the page on http://127.0.0.1:8765 and opens it in your browser. Pass `--no-browser` to only start the server.
 
-`myprs.sh` prints the same overview (without the review column) in the terminal.
+`github-pr-overview.sh` prints the same overview (without the review column) in the terminal.
 
 ## Optional: gh aliases
 
@@ -38,20 +38,20 @@ Add these under `aliases:` in `~/.config/gh/config.yml`, with the path to your c
 
 ```yaml
 aliases:
-    myprs: '!/path/to/github-pr-overview/myprs.sh'
-    myprs-web: '!open http://127.0.0.1:8765'
+    pr-overview: '!/path/to/github-pr-overview/github-pr-overview.sh'
+    pr-overview-web: '!open http://127.0.0.1:8765'
 ```
 
-Then `gh myprs` prints the list and `gh myprs-web` opens the page.
+Then `gh pr-overview` prints the list and `gh pr-overview-web` opens the page.
 
 ## Optional: start at login
 
-1. Copy `com.example.myprs.plist` to `~/Library/LaunchAgents/`, renaming the label and file if you like.
+1. Copy `github-pr-overview.plist` to `~/Library/LaunchAgents/`, renaming the file and its label if you like.
 2. Replace `/path/to/github-pr-overview` with the path to your clone, and check the `python3` path (`which python3`).
 3. Load it:
 
    ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.myprs.plist
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/github-pr-overview.plist
    ```
 
-The server then starts at login and restarts if it stops. Its output goes to `/tmp/myprs.log`.
+The server then starts at login and restarts if it stops. Its output goes to `/tmp/github-pr-overview.log`.

@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.example.myprs</string>
+    <string>github-pr-overview</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3</string>
-        <string>/path/to/github-pr-overview/myprs_app.py</string>
+        <string>/path/to/github-pr-overview/github-pr-overview.py</string>
         <string>--no-browser</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -20,8 +20,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/myprs.log</string>
+    <string>/tmp/github-pr-overview.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/myprs.log</string>
+    <string>/tmp/github-pr-overview.log</string>
 </dict>
 </plist>
