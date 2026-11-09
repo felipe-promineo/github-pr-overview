@@ -2,6 +2,8 @@
 
 A local web page that shows your GitHub pull requests as a board and sends a macOS notification when one needs you. It runs on your machine with your own `gh` login and is served on `127.0.0.1` only.
 
+![The board with your PRs on top and tracked repositories below (sample data)](docs/board.png)
+
 ## Contents
 
 - [Install](#install)
