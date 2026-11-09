@@ -1058,6 +1058,10 @@ STYLE = """
   section.collapsed .card { display: none; }
   section h2, section.collapsed { cursor: pointer; user-select: none; }
   section h2:hover, section.collapsed:hover h2 { color: var(--accent); }
+  .manual { display: inline-flex; align-items: center; margin-left: auto; padding: 0 4px; color: #d29922; }
+  .manual svg { width: 14px; height: 14px; fill: currentColor; }
+  .manual:hover { color: #e6edf3; }
+  section.collapsed .manual { margin: 0; }
   h2 { font-size: 13px; margin: 0 0 10px; display: flex; justify-content: space-between; }
   .count { color: var(--accent); }
   .card { display: block; padding: 10px; margin-bottom: 8px; border-radius: 6px; background: #0d1117;
@@ -1157,6 +1161,13 @@ GEAR_ICON = (
 )
 
 
+PIN_ICON = (
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m11.294.984 3.722 3.722a1.75 1.75 0 0 1-.504 2.826l-1.327.613a3.089 3.089 0 0 0-1.707 2.084'
+    'l-.584 2.454c-.317 1.332-1.972 1.8-2.94.832L5.75 11.311 1.78 15.28a.749.749 0 1 1-1.06-1.06l3.969-3.97-2.204-2.204c-.968-.968-.5-2.623.832-2.94'
+    'l2.454-.584a3.08 3.08 0 0 0 2.084-1.707l.613-1.327a1.75 1.75 0 0 1 2.826-.504ZM6.283 9.723l2.732 2.731a.25.25 0 0 0 .42-.119l.584-2.454'
+    'a4.586 4.586 0 0 1 2.537-3.098l1.328-.613a.25.25 0 0 0 .072-.404l-3.722-3.722a.25.25 0 0 0-.404.072l-.613 1.328a4.584 4.584 0 0 1-3.098 2.537'
+    'l-2.454.584a.25.25 0 0 0-.119.42l2.731 2.732Z"/></svg>'
+)
 BACK_ICON = (
     '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25'
     'a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L4.81 7h7.44a.75.75 0 0 1 0 1.5H4.81l2.97 2.97a.75.75 0 0 1 0 1.06Z"/></svg>'
@@ -1251,9 +1262,11 @@ def section_columns(settings, kind, sections, groups):
                 </a>"""
             for pr, tags in items
         )
-        collapsed = ' class="collapsed"' if settings["collapse_empty_sections"] and not items else ""
+        auto_collapsed = settings["collapse_empty_sections"] and not items
+        collapsed = ' class="collapsed"' if auto_collapsed else ""
+        auto = f' data-auto-collapsed="{str(auto_collapsed).lower()}"' if settings["collapse_empty_sections"] else ""
         columns.append(
-            f"""<section{collapsed} data-key="{kind}:{html.escape(section['title'])}" style="--accent:{section['color']}">
+            f"""<section{collapsed}{auto} data-key="{kind}:{html.escape(section['title'])}" style="--accent:{section['color']}">
                   <h2 title="Collapse or expand">{html.escape(section['title'])} <span class="count">{len(items)}</span></h2>
                   {cards}
                 </section>"""
@@ -1284,6 +1297,7 @@ def board_script(settings, updater):
     return f"""
 const board = document.querySelector('main');
 const PAGE_COMMIT = {commit};
+const PIN_ICON = {json.dumps(PIN_ICON)};
 function applyVersion(response) {{
   const commit = response.headers.get('X-App-Commit') || '';
   if (commit && PAGE_COMMIT && commit !== PAGE_COMMIT) {{
@@ -1305,18 +1319,45 @@ function collapseChoices() {{
     return {{}};
   }}
 }}
+function showManualChoice(section, collapsed) {{
+  let marker = section.querySelector('.manual');
+  if (collapsed === undefined || !('autoCollapsed' in section.dataset)) {{
+    if (marker) marker.remove();
+    return;
+  }}
+  if (!marker) {{
+    marker = document.createElement('span');
+    marker.className = 'manual';
+    marker.innerHTML = PIN_ICON;
+    section.querySelector('h2 .count').before(marker);
+  }}
+  marker.title = (collapsed
+    ? 'Collapsed by hand: stays collapsed when it has PRs.'
+    : "Expanded by hand: won't auto-collapse when it has no PRs.") + ' Click to go back to automatic.';
+}}
 function applyCollapseChoices() {{
   const choices = collapseChoices();
   for (const section of board.querySelectorAll('section[data-key]')) {{
-    if (section.dataset.key in choices) section.classList.toggle('collapsed', choices[section.dataset.key]);
+    const choice = choices[section.dataset.key];
+    if (choice !== undefined) section.classList.toggle('collapsed', choice);
+    showManualChoice(section, choice);
   }}
 }}
 board.addEventListener('click', event => {{
   const section = event.target.closest('section[data-key]');
+  if (section && event.target.closest('.manual')) {{
+    const choices = collapseChoices();
+    delete choices[section.dataset.key];
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(choices));
+    section.classList.toggle('collapsed', section.dataset.autoCollapsed === 'true');
+    showManualChoice(section, undefined);
+    return;
+  }}
   if (!section || event.target.closest('.card') || !(event.target.closest('h2') || section.classList.contains('collapsed'))) return;
   const choices = collapseChoices();
   choices[section.dataset.key] = section.classList.toggle('collapsed');
   localStorage.setItem(COLLAPSE_KEY, JSON.stringify(choices));
+  showManualChoice(section, choices[section.dataset.key]);
 }});
 applyCollapseChoices();
 async function loadBoard(maxAge) {{
@@ -1856,6 +1897,7 @@ def render_settings(overview, updater, saved, port_in_use):
   <fieldset>
     <legend>Board</legend>
     <label><input type="checkbox" name="collapse_empty_sections"{checked_attribute(settings['collapse_empty_sections'])}> Collapse empty sections</label>
+    <p class="hint">A section you collapse or expand by hand keeps that state and shows a pin; click the pin to let it collapse automatically again.</p>
     <label><input type="checkbox" name="auto_refresh"{checked_attribute(settings['auto_refresh'])}> Refresh every
       <input type="number" name="refresh_minutes" min="1" value="{settings['refresh_minutes']}"> minutes</label>
     <p class="hint">When refresh is off, the board and notifications only update when you reload the page.</p>
