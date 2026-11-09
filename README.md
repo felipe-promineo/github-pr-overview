@@ -64,6 +64,7 @@ The cog button opens the settings page:
 
 - **Board**: collapse empty columns, refresh interval (or off)
 - **Updates**: the running version, auto-update on or off, and **Check now**
+- **Start at login**: add or remove the login item (the same one the installer sets up). Switching restarts the board and the page follows it; turning it off keeps the board running until you log out
 - **Server**: the port; after saving, the board restarts there and the page follows (a port in use is refused)
 - **Notifications**: on or off, and the sound
 - **Sections**, **Rules**, **Tracked repositories**: see below

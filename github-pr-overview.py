@@ -1,12 +1,15 @@
+import errno
 import html
 import json
 import os
+import shutil
 import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +20,13 @@ DEFAULT_PORT = 8765
 FRESH_SECONDS = 15
 UPDATE_CHECK_SECONDS = 60 * 60
 APP_DIRECTORY = Path(__file__).resolve().parent
+LOGIN_ITEM_LABEL = "github-pr-overview"
+LOGIN_ITEM_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LOGIN_ITEM_LABEL}.plist"
+LOGIN_ITEM_TEMPLATE = APP_DIRECTORY / "github-pr-overview.plist"
+LOGIN_ITEM_PATH_DIRECTORIES = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+LOG_PATH = Path("/tmp/github-pr-overview.log")
+INSTANCE_ID = uuid.uuid4().hex
+BIND_ATTEMPTS = 40
 GITHUB_REMOTE = re.compile(r"(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?")
 SETTINGS_PATH = Path.home() / ".config" / "github-pr-overview" / "settings.json"
 REPOSITORIES_PATH = SETTINGS_PATH.with_name("repositories.json")
@@ -928,9 +938,92 @@ class Updater:
             self.wake.clear()
 
 
-def restart_server(server):
-    server.restart = True
+def app_command():
+    return [shutil.which("python3") or sys.executable, str(APP_DIRECTORY / Path(__file__).name), "--no-browser"]
+
+
+def restart_process():
+    command = app_command()
+    os.execv(command[0], command)
+
+
+def stop_server(server, after_stop):
+    server.after_stop = after_stop
     threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+def restart_server(server):
+    stop_server(server, restart_process)
+
+
+def launchd_service():
+    return f"gui/{os.getuid()}/{LOGIN_ITEM_LABEL}"
+
+
+def run_launchctl(*arguments):
+    return subprocess.run(["launchctl", *arguments], capture_output=True, text=True, timeout=30)
+
+
+def runs_as_login_item():
+    try:
+        result = run_launchctl("print", launchd_service())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    match = re.search(r"^\s*pid = (\d+)$", result.stdout, re.MULTILINE)
+    return result.returncode == 0 and match is not None and int(match.group(1)) == os.getpid()
+
+
+def read_property_list(path):
+    result = subprocess.run(["plutil", "-convert", "json", "-o", "-", str(path)], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or f"plutil couldn't read {path}")
+    return json.loads(result.stdout)
+
+
+def login_item_program():
+    if not LOGIN_ITEM_PATH.exists():
+        return None
+    try:
+        arguments = read_property_list(LOGIN_ITEM_PATH).get("ProgramArguments", [])
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return ""
+    return arguments[1] if isinstance(arguments, list) and len(arguments) > 1 else ""
+
+
+def login_item_search_path():
+    tools = (shutil.which(name) for name in ("gh", "terminal-notifier", "git"))
+    directories = [str(Path(tool).parent) for tool in tools if tool]
+    directories += [directory for directory in LOGIN_ITEM_PATH_DIRECTORIES if Path(directory).is_dir()]
+    return ":".join(dict.fromkeys(directories))
+
+
+def write_login_item():
+    login_item = read_property_list(LOGIN_ITEM_TEMPLATE)
+    login_item["Label"] = LOGIN_ITEM_LABEL
+    login_item["ProgramArguments"] = app_command()
+    login_item["EnvironmentVariables"] = {**login_item.get("EnvironmentVariables", {}), "PATH": login_item_search_path()}
+    LOGIN_ITEM_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = LOGIN_ITEM_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(login_item))
+    result = subprocess.run(["plutil", "-convert", "xml1", str(temporary_path)], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        temporary_path.unlink(missing_ok=True)
+        raise ValueError(result.stderr.strip() or "plutil couldn't write the login item")
+    os.replace(temporary_path, LOGIN_ITEM_PATH)
+
+
+def hand_over_to_login_item():
+    run_launchctl("bootout", launchd_service())
+    if run_launchctl("bootstrap", f"gui/{os.getuid()}", str(LOGIN_ITEM_PATH)).returncode != 0:
+        restart_process()
+    sys.exit(0)
+
+
+def leave_login_item():
+    with LOG_PATH.open("ab") as log:
+        subprocess.Popen(app_command(), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    run_launchctl("bootout", launchd_service())
+    sys.exit(0)
 
 
 STYLE = """
@@ -1651,16 +1744,15 @@ def local_path(value):
     return ""
 
 
-def render_updating(commit, next_path):
+def render_restarting(title, message_html, next_path):
     target = json.dumps(next_path or "/").replace("</", "<\\/")
-    expected = json.dumps(commit)
-    content = f"""<h1>Updating</h1>
-<p>The board updated to <code>{html.escape(commit[:7])}</code> and is restarting. This page goes back when it's up.</p>
+    content = f"""<h1>{html.escape(title)}</h1>
+<p>{message_html} This page goes back when it's up.</p>
 <script>
 async function follow() {{
   try {{
-    const response = await fetch('/version', {{cache: 'no-store'}});
-    if (response.ok && (await response.text()) === {expected}) {{
+    const response = await fetch('/instance', {{cache: 'no-store'}});
+    if (response.ok && (await response.text()) !== {json.dumps(INSTANCE_ID)}) {{
       location.href = {target};
       return;
     }}
@@ -1670,7 +1762,12 @@ async function follow() {{
 }}
 setTimeout(follow, 300);
 </script>"""
-    return page("Updating · GitHub PR overview", "", content)
+    return page(f"{title} · GitHub PR overview", "", content)
+
+
+def render_updating(commit, next_path):
+    message = f"The board updated to <code>{html.escape(commit[:7])}</code> and is restarting."
+    return render_restarting("Updating", message, next_path)
 
 
 def update_status(updater):
@@ -1715,6 +1812,26 @@ def version_line(updater):
     return f'{commit} <span class="hint">{html.escape(version["subject"])}</span>'
 
 
+def login_item_fields():
+    program = login_item_program()
+    this_app = str(APP_DIRECTORY / Path(__file__).name)
+    if program is None:
+        status = "The board doesn't start at login. It runs only as long as the process that started it."
+        button = '<button type="submit" form="login-item-form" formaction="/login-item/enable">Start at login</button>'
+    else:
+        status = "The board starts at login and restarts by itself if it stops."
+        if program != this_app:
+            status += f' <span class="notice warning">The login item runs another copy: <code>{html.escape(program)}</code>.</span>'
+        button = '<button type="submit" form="login-item-form" formaction="/login-item/disable">Don\'t start at login</button>'
+        if program != this_app:
+            button = '<button type="submit" form="login-item-form" formaction="/login-item/enable">Use this copy</button> ' + button
+    return f"""<p>{status}</p>
+    <p class="actions">{button}</p>
+    <p class="hint">This adds or removes a macOS login item (<code>{html.escape(str(LOGIN_ITEM_PATH).replace(str(Path.home()), "~", 1))}</code>),
+      the same one the installer sets up; it logs to <code>{LOG_PATH}</code>. Switching restarts the board, and this page follows it.
+      Unsaved settings on this page are lost, so save them first.</p>"""
+
+
 def render_settings(overview, updater, saved, port_in_use):
     settings = overview.settings
     sound_options = "".join(
@@ -1749,6 +1866,10 @@ def render_settings(overview, updater, saved, port_in_use):
       Updates only fast-forward: local changes or commits that conflict stop them, and the error shows here.</p>
     <p class="actions"><button type="button" id="check-updates"{" disabled" if updater.version is None else ""}>Check now</button>
       <span class="hint" id="update-status">{html.escape(update_status(updater))}</span></p>
+  </fieldset>
+  <fieldset>
+    <legend>Start at login</legend>
+    {login_item_fields()}
   </fieldset>
   <fieldset>
     <legend>Server</legend>
@@ -1815,6 +1936,7 @@ def render_settings(overview, updater, saved, port_in_use):
     {notice}
   </div>
 </form>
+<form id="login-item-form" method="post" action="/login-item/enable"></form>
 <dialog id="leave-dialog">
   <h2>Unsaved changes</h2>
   <p>You changed settings without saving them. Save them before leaving?</p>
@@ -1842,6 +1964,8 @@ class Handler(BaseHTTPRequestHandler):
             max_age = parse_qs(url.query).get("max_age", [""])[0]
             max_age = int(max_age) if max_age.isdigit() else FRESH_SECONDS
             self.respond(board_content(overview.fresh_board(max_age)), headers=self.update_headers())
+        elif url.path == "/instance":
+            self.respond(INSTANCE_ID, content_type="text/plain")
         elif url.path == "/version":
             self.respond(updater.version["commit"] if updater.version else "", content_type="text/plain")
         elif url.path == "/settings":
@@ -1871,6 +1995,10 @@ class Handler(BaseHTTPRequestHandler):
             self.apply_settings(settings_from_form(form), local_path(form.get("next", [""])[0]))
         elif path == "/settings/reset":
             self.apply_settings(normalized_settings({}), "")
+        elif path == "/login-item/enable":
+            self.enable_login_item()
+        elif path == "/login-item/disable":
+            self.disable_login_item()
         elif path == "/update":
             self.install_update(local_path(form.get("next", [""])[0]))
         elif path == "/update/check":
@@ -1892,6 +2020,31 @@ class Handler(BaseHTTPRequestHandler):
             "X-App-Updates": str(updater.pending),
             "X-App-Update-Title": update_title(updater.pending),
         }
+
+    def enable_login_item(self):
+        try:
+            write_login_item()
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            self.respond(page("Start at login failed · GitHub PR overview", "", f"""<h1>Couldn't set up the login item</h1>
+<pre class="error">{html.escape(str(error))}</pre>
+<p><a href="/settings">Back to the settings</a></p>"""), 500)
+            return
+        if runs_as_login_item():
+            self.redirect("/settings")
+            return
+        message = "The board now starts at login and is restarting as the login item."
+        self.respond(render_restarting("Starting at login", message, "/settings"))
+        stop_server(self.server, hand_over_to_login_item)
+
+    def disable_login_item(self):
+        LOGIN_ITEM_PATH.unlink(missing_ok=True)
+        if not runs_as_login_item():
+            run_launchctl("bootout", launchd_service())
+            self.redirect("/settings")
+            return
+        message = "The board no longer starts at login and is restarting as a normal process, so it keeps running until you log out."
+        self.respond(render_restarting("Leaving the login item", message, "/settings"))
+        stop_server(self.server, leave_login_item)
 
     def install_update(self, next_path):
         updater = self.server.updater
@@ -1969,16 +2122,20 @@ def set_port(value):
 def serve(open_browser):
     settings = load_settings()
     port = settings["port"]
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    except OSError as error:
-        sys.exit(f"Can't serve on port {port}: {error.strerror}. Pick another one with --set-port PORT.")
+    for attempt in range(BIND_ATTEMPTS):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE or attempt == BIND_ATTEMPTS - 1:
+                sys.exit(f"Can't serve on port {port}: {error.strerror}. Pick another one with --set-port PORT.")
+            time.sleep(0.25)
     overview = Overview(settings, Notifier())
     server.overview = overview
     updater = Updater(overview, lambda: restart_server(server))
     server.updater = updater
     server.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    server.restart = False
+    server.after_stop = None
     url = board_url(port)
     print(f"Serving {url} (Ctrl+C to stop)", flush=True)
     threading.Thread(target=overview.watch, daemon=True).start()
@@ -1990,8 +2147,8 @@ def serve(open_browser):
     except KeyboardInterrupt:
         pass
     server.server_close()
-    if server.restart:
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "--no-browser"])
+    if server.after_stop is not None:
+        server.after_stop()
 
 
 if __name__ == "__main__":
