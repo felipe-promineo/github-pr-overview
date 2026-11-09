@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -16,6 +17,7 @@ FRESH_SECONDS = 15
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 ALLOWED_ORIGINS = {f"http://{host}" for host in ALLOWED_HOSTS}
 SETTINGS_PATH = Path.home() / ".config" / "github-pr-overview" / "settings.json"
+REPOSITORIES_PATH = SETTINGS_PATH.with_name("repositories.json")
 SOUNDS_DIRECTORY = Path("/System/Library/Sounds")
 SEARCH_SYNTAX_URL = "https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests"
 
@@ -23,8 +25,18 @@ MY_PULL_REQUESTS = "is:pr is:open author:@me archived:false"
 REVIEW_REQUESTS = "is:pr is:open archived:false review-requested:@me -author:@me"
 
 YES_NO = ["yes", "no"]
+REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+MAX_PER_REPO = 100
+PARALLEL_FETCHES = 6
+GATEWAY_ERRORS = ("HTTP 502", "HTTP 503", "HTTP 504")
 
 CONDITIONS = {
+    "state": {
+        "label": "State",
+        "values": ["open", "merged", "closed"],
+        "description": "whether the PR is open, merged, or closed without merging",
+        "phrases": {"open": "open", "merged": "merged", "closed": "closed without merging"},
+    },
     "draft": {
         "label": "Draft",
         "values": YES_NO,
@@ -104,6 +116,9 @@ DEFAULT_SETTINGS = {
     "notifications": True,
     "sound": "Glass",
     "first_match_only": True,
+    "hide_my_prs_in_tracked": True,
+    "tracked_per_repo": 20,
+    "tracked_repos": [],
     "rules": [
         {"id": "needs_action", "name": "Has a problem", "match": "any", "conditions": [
             {"condition": "changes_requested", "value": "yes"},
@@ -112,6 +127,10 @@ DEFAULT_SETTINGS = {
         ]},
         {"id": "waiting", "name": "Reviewers requested", "match": "all",
          "conditions": [{"condition": "reviewers_requested", "value": "yes"}]},
+        {"id": "is_draft", "name": "Draft", "match": "all", "conditions": [{"condition": "draft", "value": "yes"}]},
+        {"id": "approved", "name": "Approved", "match": "all", "conditions": [{"condition": "approved", "value": "yes"}]},
+        {"id": "merged", "name": "Merged", "match": "all", "conditions": [{"condition": "state", "value": "merged"}]},
+        {"id": "closed", "name": "Closed", "match": "all", "conditions": [{"condition": "state", "value": "closed"}]},
     ],
     "sections": [
         {"title": "Draft", "color": "#8b949e", "query": f"{MY_PULL_REQUESTS} draft:true", "priority": 1, "notify": False, "rule": ""},
@@ -121,7 +140,18 @@ DEFAULT_SETTINGS = {
         {"title": "Ready for merge", "color": "#3fb950", "query": f"{MY_PULL_REQUESTS} review:approved", "priority": 3, "notify": True, "rule": ""},
         {"title": "Needs my review", "color": "#bc8cff", "query": REVIEW_REQUESTS, "priority": 6, "notify": True, "rule": ""},
     ],
+    "tracked_sections": [
+        {"title": "Draft", "color": "#8b949e", "priority": 3, "notify": False, "rule": "is_draft"},
+        {"title": "Open", "color": "#58a6ff", "priority": 7, "notify": False, "rule": ""},
+        {"title": "Ready for review", "color": "#d29922", "priority": 6, "notify": False, "rule": "waiting"},
+        {"title": "Needs action", "color": "#f85149", "priority": 4, "notify": False, "rule": "needs_action"},
+        {"title": "Ready for merge", "color": "#3fb950", "priority": 5, "notify": False, "rule": "approved"},
+        {"title": "Merged", "color": "#a371f7", "priority": 1, "notify": False, "rule": "merged"},
+        {"title": "Closed", "color": "#6e7681", "priority": 2, "notify": False, "rule": "closed"},
+    ],
 }
+
+LIST_SETTINGS = ("rules", "sections", "tracked_sections", "tracked_repos")
 
 PULL_REQUEST_FIELDS = """
 fragment PullRequestFields on PullRequest {
@@ -130,6 +160,7 @@ fragment PullRequestFields on PullRequest {
         number
         isDraft
         mergeable
+        state
         reviewDecision
         updatedAt
         repository { nameWithOwner }
@@ -172,6 +203,10 @@ def is_priority(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def is_per_repo(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_PER_REPO
+
+
 def is_sound(value):
     return isinstance(value, str) and (value == "" or value in available_sounds())
 
@@ -183,6 +218,8 @@ VALIDATORS = {
     "notifications": is_bool,
     "sound": is_sound,
     "first_match_only": is_bool,
+    "hide_my_prs_in_tracked": is_bool,
+    "tracked_per_repo": is_per_repo,
     "title": is_text,
     "color": is_color,
     "query": is_text,
@@ -269,20 +306,43 @@ def normalized_section(raw, index, rule_ids, from_before_rules):
     return section
 
 
+def normalized_tracked_section(raw, index, rule_ids):
+    fallback = {"title": "Section", "color": "#8b949e", "priority": index + 1, "notify": False}
+    section = {key: pick(raw, fallback, key) for key in fallback}
+    rule = raw.get("rule") if isinstance(raw.get("rule"), str) else ""
+    section["rule"] = rule if rule in rule_ids else ""
+    return section
+
+
+def normalized_repositories(raw):
+    names = raw if isinstance(raw, list) else []
+    return list(dict.fromkeys(name for name in names if isinstance(name, str) and REPO_NAME.fullmatch(name)))
+
+
+def non_empty_list(raw, key):
+    value = raw.get(key)
+    return value if isinstance(value, list) and value else DEFAULT_SETTINGS[key]
+
+
 def normalized_settings(raw):
     raw = raw if isinstance(raw, dict) else {}
-    raw_rules = raw.get("rules") if isinstance(raw.get("rules"), list) else DEFAULT_SETTINGS["rules"]
-    raw_sections = raw.get("sections")
-    if not isinstance(raw_sections, list) or not raw_sections:
-        raw_sections = DEFAULT_SETTINGS["sections"]
+    raw_rules = list(raw["rules"]) if isinstance(raw.get("rules"), list) else list(DEFAULT_SETTINGS["rules"])
+    if "tracked_sections" not in raw:
+        known = {rule.get("id") for rule in raw_rules if isinstance(rule, dict)}
+        raw_rules += [rule for rule in DEFAULT_SETTINGS["rules"] if rule["id"] not in known]
     rules = normalized_rules(raw_rules)
     rule_ids = {rule["id"] for rule in rules}
-    settings = {key: pick(raw, DEFAULT_SETTINGS, key) for key in DEFAULT_SETTINGS if key not in ("rules", "sections")}
+    settings = {key: pick(raw, DEFAULT_SETTINGS, key) for key in DEFAULT_SETTINGS if key not in LIST_SETTINGS}
     settings["rules"] = rules
     settings["sections"] = [
         normalized_section(section if isinstance(section, dict) else {}, index, rule_ids, "rules" not in raw)
-        for index, section in enumerate(raw_sections)
+        for index, section in enumerate(non_empty_list(raw, "sections"))
     ]
+    settings["tracked_sections"] = [
+        normalized_tracked_section(section if isinstance(section, dict) else {}, index, rule_ids)
+        for index, section in enumerate(non_empty_list(raw, "tracked_sections"))
+    ]
+    settings["tracked_repos"] = normalized_repositories(raw.get("tracked_repos"))
     return settings
 
 
@@ -300,9 +360,23 @@ def save_settings(settings):
     os.replace(temporary_path, SETTINGS_PATH)
 
 
-def section_order(form, count):
+def load_repository_list():
     try:
-        order = [int(index) for index in form.get("section_order", [""])[0].split(",")]
+        return json.loads(REPOSITORIES_PATH.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def save_repository_list(repository_list):
+    REPOSITORIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = REPOSITORIES_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(repository_list))
+    os.replace(temporary_path, REPOSITORIES_PATH)
+
+
+def section_order(form, count, field):
+    try:
+        order = [int(index) for index in form.get(field, [""])[0].split(",")]
     except ValueError:
         return list(range(count))
     return order if sorted(order) == list(range(count)) else list(range(count))
@@ -319,9 +393,12 @@ def settings_from_form(form):
         value = text(name)
         return int(value) if value.isdigit() else None
 
-    count = 0
-    while f"section{count}_title" in form:
-        count += 1
+    def count_of(prefix):
+        count = 0
+        while f"{prefix}{count}_title" in form:
+            count += 1
+        return count
+
     rule_indices = sorted(int(match.group(1)) for key in form if (match := re.fullmatch(r"rule(\d+)_id", key)))
     return normalized_settings({
         "collapse_empty_sections": checked("collapse_empty_sections"),
@@ -330,6 +407,9 @@ def settings_from_form(form):
         "notifications": checked("notifications"),
         "sound": text("sound"),
         "first_match_only": checked("first_match_only"),
+        "hide_my_prs_in_tracked": checked("hide_my_prs_in_tracked"),
+        "tracked_per_repo": number("tracked_per_repo"),
+        "tracked_repos": form.get("tracked_repo", []),
         "rules": [
             {
                 "id": text(f"rule{index}_id"),
@@ -351,7 +431,17 @@ def settings_from_form(form):
                 "notify": checked(f"section{index}_notify"),
                 "rule": text(f"section{index}_rule"),
             }
-            for index in section_order(form, count)
+            for index in section_order(form, count_of("section"), "section_order")
+        ],
+        "tracked_sections": [
+            {
+                "title": text(f"tracked{index}_title"),
+                "color": text(f"tracked{index}_color"),
+                "priority": number(f"tracked{index}_priority"),
+                "notify": checked(f"tracked{index}_notify"),
+                "rule": text(f"tracked{index}_rule"),
+            }
+            for index in section_order(form, count_of("tracked"), "tracked_order")
         ],
     })
 
@@ -360,22 +450,125 @@ def section_queries(sections):
     return list(dict.fromkeys(section["query"] for section in sections))
 
 
-def build_query(query_count):
-    variables = ", ".join(f"$q{index}: String!" for index in range(query_count))
+def build_query(query_count, repository_count, per_repo):
+    variables = ", ".join(
+        [f"$q{index}: String!" for index in range(query_count)]
+        + [f"$o{index}: String!, $n{index}: String!" for index in range(repository_count)]
+    )
     searches = "".join(
         f"  q{index}: search(query: $q{index}, type: ISSUE, first: 100) {{ nodes {{ ...PullRequestFields }} }}\n"
         for index in range(query_count)
     )
-    return f"query({variables}) {{\n  viewer {{ login url }}\n{searches}}}\n{PULL_REQUEST_FIELDS}"
+    repositories = "".join(
+        f"  r{index}: repository(owner: $o{index}, name: $n{index}) {{ pullRequests(first: {per_repo}, "
+        f"orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ nodes {{ ...PullRequestFields }} }} }}\n"
+        for index in range(repository_count)
+    )
+    return f"query({variables}) {{\n  viewer {{ login url }}\n{searches}{repositories}}}\n{PULL_REQUEST_FIELDS}"
 
 
-def fetch_pull_requests(sections):
-    queries = section_queries(sections)
-    arguments = ["gh", "api", "graphql", "-f", f"query={build_query(len(queries))}"]
-    for index, query in enumerate(queries):
-        arguments += ["-f", f"q{index}={query}"]
-    output = subprocess.run(arguments, capture_output=True, text=True, check=True).stdout
-    return json.loads(output)["data"]
+def run_graphql_once(arguments):
+    result = subprocess.run(arguments, capture_output=True, text=True)
+    try:
+        response = json.loads(result.stdout) if result.stdout.strip() else {}
+    except ValueError:
+        message = result.stderr.strip() or "gh returned a response that isn't JSON"
+        if any(code in message for code in GATEWAY_ERRORS):
+            message += " (GitHub gave up on the query, usually because it took longer than 10 seconds)"
+        raise subprocess.CalledProcessError(result.returncode, arguments, result.stdout, message)
+    if not response.get("data"):
+        raise subprocess.CalledProcessError(result.returncode, arguments, result.stdout, result.stderr or "gh returned no data")
+    return response["data"], response.get("errors") or []
+
+
+def run_graphql(arguments):
+    try:
+        return run_graphql_once(arguments)
+    except subprocess.CalledProcessError as error:
+        if not any(code in (error.stderr or "") for code in GATEWAY_ERRORS):
+            raise
+        return run_graphql_once(arguments)
+
+
+def search_arguments(queries):
+    arguments = ["gh", "api", "graphql", "-f", f"query={build_query(len(queries), 0, 0)}"]
+    for index, search in enumerate(queries):
+        arguments += ["-f", f"q{index}={search}"]
+    return arguments
+
+
+def fetch_searches(queries):
+    data, errors = run_graphql(search_arguments(queries))
+    if errors:
+        raise subprocess.CalledProcessError(1, "gh api graphql", "", "; ".join(error.get("message", json.dumps(error)) for error in errors))
+    return data
+
+
+def fetch_repository(repository, per_repo):
+    owner, name = repository.split("/", 1)
+    arguments = ["gh", "api", "graphql", "-f", f"query={build_query(0, 1, per_repo)}", "-f", f"o0={owner}", "-f", f"n0={name}"]
+    try:
+        data, errors = run_graphql(arguments)
+    except subprocess.CalledProcessError as error:
+        return None, (error.stderr or "gh failed").strip()
+    if errors or not data.get("r0"):
+        return None, "; ".join(error.get("message", "unknown error") for error in errors) or "no data"
+    return data["r0"], None
+
+
+def fetch_pull_requests(settings):
+    queries = section_queries(settings["sections"])
+    repositories = settings["tracked_repos"]
+    with ThreadPoolExecutor(PARALLEL_FETCHES) as pool:
+        searches = pool.submit(fetch_searches, queries)
+        results = list(pool.map(lambda repository: fetch_repository(repository, settings["tracked_per_repo"]), repositories))
+        data = searches.result()
+    repository_errors = {}
+    for index, (repository, (result, error)) in enumerate(zip(repositories, results)):
+        data[f"r{index}"] = result
+        if error is not None:
+            repository_errors[repository] = error
+    return data, repository_errors
+
+
+REPOSITORY_LIST_QUERY = """
+query($after: String) {
+  viewer {
+    login
+    organizations(first: 100) { nodes { login } }
+    repositories(first: 100, after: $after, orderBy: {field: NAME, direction: ASC},
+                 affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER],
+                 ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) {
+      pageInfo { hasNextPage endCursor }
+      nodes { nameWithOwner isPrivate isArchived owner { login } }
+    }
+  }
+}
+"""
+
+
+def fetch_repository_list():
+    repositories, after = [], None
+    while True:
+        arguments = ["gh", "api", "graphql", "-f", f"query={REPOSITORY_LIST_QUERY}"]
+        if after:
+            arguments += ["-f", f"after={after}"]
+        viewer = run_graphql(arguments)[0]["viewer"]
+        page = viewer["repositories"]
+        repositories += [
+            {"name": node["nameWithOwner"], "owner": node["owner"]["login"], "private": node["isPrivate"], "archived": node["isArchived"]}
+            for node in page["nodes"]
+            if node
+        ]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    return {
+        "login": viewer["login"],
+        "organizations": [node["login"] for node in viewer["organizations"]["nodes"] if node],
+        "repositories": repositories,
+        "loaded_at": time.strftime("%Y-%m-%d %H:%M"),
+    }
 
 
 def fetch_viewer():
@@ -403,6 +596,7 @@ def pull_request_facts(pr, viewer_login):
         if present
     ]
     return {
+        "state": pr["state"].lower(),
         "draft": pr["isDraft"],
         "approved": pr["reviewDecision"] == "APPROVED",
         "changes_requested": changes_requested,
@@ -436,6 +630,8 @@ def rule_matches(rule, facts, rules_by_id):
 
 
 def card_tags(pr, facts):
+    if facts["state"] != "open":
+        return [f"by {pr['author']['login']}"] if pr["author"] else []
     if not facts["author_is_me"]:
         tags = [f"by {pr['author']['login']}"] if pr["author"] else []
         if facts["requested_from_me"]:
@@ -454,18 +650,14 @@ def by_last_update(pull_requests):
     return sorted(pull_requests, key=lambda p: p["updatedAt"], reverse=True)
 
 
-def group_pull_requests(data, settings):
-    sections = settings["sections"]
-    queries = section_queries(sections)
-    viewer_login = data["viewer"]["login"]
+def place_in_sections(sections, nodes_of, settings, viewer_login, hidden):
     rules_by_id = {rule["id"]: rule for rule in settings["rules"]}
     groups = [[] for _ in sections]
     placed = set()
     for index in sorted(range(len(sections)), key=lambda position: (sections[position]["priority"], position)):
         section = sections[index]
-        nodes = [node for node in data[f"q{queries.index(section['query'])}"]["nodes"] if node and "url" in node]
-        for pr in by_last_update(nodes):
-            if settings["first_match_only"] and pr["url"] in placed:
+        for pr in by_last_update(nodes_of(section)):
+            if pr["url"] in hidden or (settings["first_match_only"] and pr["url"] in placed):
                 continue
             facts = pull_request_facts(pr, viewer_login)
             rule = rules_by_id.get(section["rule"])
@@ -473,6 +665,38 @@ def group_pull_requests(data, settings):
                 groups[index].append((pr, card_tags(pr, facts)))
                 placed.add(pr["url"])
     return groups
+
+
+def valid_nodes(nodes):
+    return [node for node in nodes if node and "url" in node]
+
+
+def group_pull_requests(data, settings):
+    queries = section_queries(settings["sections"])
+    viewer_login = data["viewer"]["login"]
+    groups = place_in_sections(
+        settings["sections"],
+        lambda section: valid_nodes(data[f"q{queries.index(section['query'])}"]["nodes"]),
+        settings,
+        viewer_login,
+        set(),
+    )
+    tracked_nodes = [
+        node
+        for index in range(len(settings["tracked_repos"]))
+        if data.get(f"r{index}")
+        for node in valid_nodes(data[f"r{index}"]["pullRequests"]["nodes"])
+    ]
+    shown = {pr["url"] for items in groups for pr, _ in items} if settings["hide_my_prs_in_tracked"] else set()
+    tracked = place_in_sections(settings["tracked_sections"], lambda section: tracked_nodes, settings, viewer_login, shown)
+    return groups, tracked
+
+
+def board_entries(settings, groups, tracked):
+    return [
+        *((("mine", index), section, items) for index, (section, items) in enumerate(zip(settings["sections"], groups))),
+        *((("tracked", index), section, items) for index, (section, items) in enumerate(zip(settings["tracked_sections"], tracked))),
+    ]
 
 
 def play_sound(name):
@@ -498,12 +722,12 @@ class Notifier:
         self._seen = None
         self._settings = None
 
-    def update(self, groups, settings):
+    def update(self, entries, settings):
         current = {
-            (index, pr["url"]): (section["title"], pr, tags)
-            for index, section in enumerate(settings["sections"])
+            (key, pr["url"]): (section["title"], pr, tags)
+            for key, section, items in entries
             if section["notify"]
-            for pr, tags in groups[index]
+            for pr, tags in items
         }
         with self._lock:
             known = self._seen if self._settings is settings else None
@@ -524,6 +748,8 @@ class Overview:
         self.viewer = None
         self.board = None
         self._refresh_lock = threading.Lock()
+        self.repository_list = load_repository_list()
+        self._repository_lock = threading.Lock()
 
     def change_settings(self, settings):
         self.settings = settings
@@ -539,19 +765,33 @@ class Overview:
             if board is not None and time.monotonic() - board["loaded_at"] <= max_age:
                 return board
             settings = self.settings
-            board = {"settings": settings, "groups": None, "error": None, "loaded_at": time.monotonic()}
+            board = {
+                "settings": settings,
+                "groups": None,
+                "tracked": None,
+                "repository_errors": {},
+                "error": None,
+                "loaded_at": time.monotonic(),
+            }
             try:
-                data = fetch_pull_requests(settings["sections"])
-                board["groups"] = group_pull_requests(data, settings)
+                data, board["repository_errors"] = fetch_pull_requests(settings)
+                board["groups"], board["tracked"] = group_pull_requests(data, settings)
                 self.viewer = data["viewer"]
             except subprocess.CalledProcessError as error:
                 board["error"] = error.stderr
             except (KeyError, ValueError) as error:
                 board["error"] = f"Unexpected response from gh: {error!r}"
             if board["groups"] is not None:
-                self.notifier.update(board["groups"], settings)
+                self.notifier.update(board_entries(settings, board["groups"], board["tracked"]), settings)
             self.board = board
             return board
+
+    def repositories(self, reload):
+        with self._repository_lock:
+            if reload or self.repository_list is None:
+                self.repository_list = fetch_repository_list()
+                save_repository_list(self.repository_list)
+            return self.repository_list
 
     def current_viewer(self):
         if self.viewer is None:
@@ -591,11 +831,17 @@ STYLE = """
   .button:hover { border-color: #8b949e; }
   .button.icon { display: inline-flex; padding: 6px; }
   .button.icon svg { width: 16px; height: 16px; fill: currentColor; }
-  main { display: flex; gap: 12px; align-items: flex-start; }
+  .columns { display: flex; gap: 12px; align-items: flex-start; }
+  .row + .row { margin-top: 24px; }
+  h2.row-title { font-size: 15px; margin: 0 0 10px; display: block; }
+  .row-errors { margin-bottom: 10px; }
   section { flex: 1 1 0; min-width: 200px; background: #161b22; border: 1px solid #30363d;
             border-top: 3px solid var(--accent); border-radius: 8px; padding: 12px; }
   section.collapsed { flex: 0 0 auto; min-width: 0; padding: 12px 8px; }
   section.collapsed h2 { writing-mode: vertical-rl; margin: 0; gap: 8px; color: #8b949e; }
+  section.collapsed .card { display: none; }
+  section h2, section.collapsed { cursor: pointer; user-select: none; }
+  section h2:hover, section.collapsed:hover h2 { color: var(--accent); }
   h2 { font-size: 13px; margin: 0 0 10px; display: flex; justify-content: space-between; }
   .count { color: var(--accent); }
   .card { display: block; padding: 10px; margin-bottom: 8px; border-radius: 6px; background: #0d1117;
@@ -637,6 +883,15 @@ STYLE = """
   .conditions { flex-direction: column; align-items: flex-start; }
   .summary { margin: 8px 0 0; }
   .actions { display: flex; gap: 12px; align-items: center; }
+  .repo-tools { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  .repo-tools input[type=search] { flex: 1 1 260px; }
+  .repo-picker { max-height: 360px; overflow: auto; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; padding: 4px 12px; }
+  .repo-group h3 { font-size: 12px; color: #8b949e; margin: 10px 0 4px; }
+  .repo-option { display: flex; gap: 6px; align-items: center; padding: 2px 0; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 10px; border: 1px solid #30363d; color: #8b949e; }
+  .badge.private { color: #d29922; border-color: #d29922; }
+  .badge.missing { color: #f85149; border-color: #f85149; }
+  .repo-option[hidden], .repo-group[hidden] { display: none; }
 """
 
 ICON = (
@@ -725,12 +980,9 @@ def refresh_hint(settings):
     return f"Refreshes every {minutes} minute{'s' if minutes != 1 else ''}, or reload the page"
 
 
-def board_content(board):
-    if board["error"] is not None:
-        return f'<pre class="error">gh failed:\n{html.escape(board["error"])}</pre>'
-    settings = board["settings"]
+def section_columns(settings, kind, sections, groups):
     columns = []
-    for section, items in zip(settings["sections"], board["groups"]):
+    for section, items in zip(sections, groups):
         cards = "".join(
             f"""<a class="card" href="{html.escape(pr['url'])}" target="_blank">
                   <div class="repo">{html.escape(pr['repository']['nameWithOwner'])}#{pr['number']}</div>
@@ -741,12 +993,29 @@ def board_content(board):
         )
         collapsed = ' class="collapsed"' if settings["collapse_empty_sections"] and not items else ""
         columns.append(
-            f"""<section{collapsed} style="--accent:{section['color']}">
-                  <h2>{html.escape(section['title'])} <span class="count">{len(items)}</span></h2>
+            f"""<section{collapsed} data-key="{kind}:{html.escape(section['title'])}" style="--accent:{section['color']}">
+                  <h2 title="Collapse or expand">{html.escape(section['title'])} <span class="count">{len(items)}</span></h2>
                   {cards}
                 </section>"""
         )
-    return "".join(columns)
+    return f'<div class="columns">{"".join(columns)}</div>'
+
+
+def board_content(board):
+    if board["error"] is not None:
+        return f'<pre class="error">gh failed:\n{html.escape(board["error"])}</pre>'
+    settings = board["settings"]
+    mine = section_columns(settings, "mine", settings["sections"], board["groups"])
+    if not settings["tracked_repos"]:
+        return mine
+    errors = "".join(
+        f'<pre class="error row-errors">Couldn\'t load {html.escape(repository)}: {html.escape(message)}</pre>'
+        for repository, message in board["repository_errors"].items()
+    )
+    tracked = section_columns(settings, "tracked", settings["tracked_sections"], board["tracked"])
+    count = len(settings["tracked_repos"])
+    return f"""<div class="row"><h2 class="row-title">My PRs</h2>{mine}</div>
+<div class="row"><h2 class="row-title">Tracked repositories <span class="hint">{count} repo{'s' if count != 1 else ''}</span></h2>{errors}{tracked}</div>"""
 
 
 def board_script(settings):
@@ -754,11 +1023,36 @@ def board_script(settings):
     return f"""
 const board = document.querySelector('main');
 const status = document.getElementById('status');
+const COLLAPSE_KEY = 'collapsed-sections';
+function collapseChoices() {{
+  try {{
+    return JSON.parse(localStorage.getItem(COLLAPSE_KEY)) || {{}};
+  }} catch (error) {{
+    return {{}};
+  }}
+}}
+function applyCollapseChoices() {{
+  const choices = collapseChoices();
+  for (const section of board.querySelectorAll('section[data-key]')) {{
+    if (section.dataset.key in choices) section.classList.toggle('collapsed', choices[section.dataset.key]);
+  }}
+}}
+board.addEventListener('click', event => {{
+  const section = event.target.closest('section[data-key]');
+  if (!section || event.target.closest('.card') || !(event.target.closest('h2') || section.classList.contains('collapsed'))) return;
+  const choices = collapseChoices();
+  choices[section.dataset.key] = section.classList.toggle('collapsed');
+  localStorage.setItem(COLLAPSE_KEY, JSON.stringify(choices));
+}});
+applyCollapseChoices();
 async function loadBoard(maxAge) {{
   status.textContent = 'Updating…';
   try {{
     const response = await fetch('/board?max_age=' + maxAge);
-    if (response.ok) board.innerHTML = await response.text();
+    if (response.ok) {{
+      board.innerHTML = await response.text();
+      applyCollapseChoices();
+    }}
     status.textContent = response.ok ? '' : 'Update failed';
   }} catch (error) {{
     status.textContent = 'Update failed';
@@ -819,8 +1113,8 @@ def rule_card(rule_index, rule, rules):
 </div>"""
 
 
-def section_fields(index, section, rules):
-    prefix = f"section{index}_"
+def section_fields(kind, index, section, rules):
+    prefix = f"{kind}{index}_"
     rule_choices = [("", EVERY_PULL_REQUEST), *((rule["id"], rule["name"]) for rule in rules)]
     return f"""<div class="section-card" data-index="{index}" style="--accent:{section['color']}">
   <div class="section-row">
@@ -832,10 +1126,73 @@ def section_fields(index, section, rules):
     <label class="field"><input type="checkbox" name="{prefix}notify"{checked_attribute(section['notify'])}> Notify</label>
   </div>
   <div class="section-row">
-    <label class="field grow">Query <input type="text" class="grow" name="{prefix}query" value="{html.escape(section['query'])}" required></label>
+    {query_field(prefix, section)}
     <label class="field">Rule <select class="rule-select" name="{prefix}rule">{option_list(rule_choices, section['rule'])}</select></label>
   </div>
 </div>"""
+
+
+def query_field(prefix, section):
+    if "query" not in section:
+        return '<span class="field grow">Every PR in the tracked repositories</span>'
+    return f'<label class="field grow">Query <input type="text" class="grow" name="{prefix}query" value="{html.escape(section["query"])}" required></label>'
+
+
+def repository_badges(repository):
+    if repository is None:
+        return ""
+    badges = ['<span class="badge private">private</span>' if repository["private"] else '<span class="badge">public</span>']
+    if repository["archived"]:
+        badges.append('<span class="badge">archived</span>')
+    return "".join(badges)
+
+
+def repository_option(name, checked, repository):
+    return (
+        f'<label class="repo-option" data-name="{html.escape(name.lower())}">'
+        f'<input type="checkbox" name="tracked_repo" value="{html.escape(name)}"{checked_attribute(checked)}> '
+        f'{html.escape(name)} {repository_badges(repository)}</label>'
+    )
+
+
+def repository_group(title, options, empty_hint):
+    body = "".join(options) if options else f'<p class="hint">{empty_hint}</p>'
+    return f'<div class="repo-group"><h3>{html.escape(title)} <span class="count">{len(options)}</span></h3>{body}</div>'
+
+
+def selected_repositories(settings, repository_list):
+    known = {repository["name"]: repository for repository in repository_list["repositories"]} if repository_list else {}
+    options = [repository_option(name, True, known.get(name)) for name in settings["tracked_repos"]]
+    body = "".join(options) if options else '<p class="hint">None yet. Check repositories in the list below to track them.</p>'
+    return f'<div class="repo-group" id="repo-selected"><h3>Tracked</h3>{body}</div>'
+
+
+def repository_groups(repository_list):
+    login = repository_list["login"]
+    by_owner = {}
+    for repository in repository_list["repositories"]:
+        by_owner.setdefault(repository["owner"], []).append(repository)
+    own = by_owner.pop(login, [])
+    sso_hint = (
+        "No repositories visible. If this org uses SSO, run <code>gh auth refresh</code> "
+        "and authorize the token for it on github.com/settings/tokens."
+    )
+    groups = [
+        repository_group(f"Personal · public ({login})", [repository_option(r["name"], False, r) for r in own if not r["private"]], "None."),
+        repository_group(f"Personal · private ({login})", [repository_option(r["name"], False, r) for r in own if r["private"]], "None."),
+    ]
+    organizations = sorted(set(repository_list["organizations"]), key=str.lower)
+    for organization in organizations:
+        options = [repository_option(r["name"], False, r) for r in by_owner.pop(organization, [])]
+        groups.append(repository_group(f"Org · {organization}", options, sso_hint))
+    for owner in sorted(by_owner, key=str.lower):
+        groups.append(repository_group(f"{owner} (collaborator)", [repository_option(r["name"], False, r) for r in by_owner[owner]], "None."))
+    total = len(repository_list["repositories"])
+    summary = (
+        f'<p class="hint">{total} repositories the gh account can see, listed {html.escape(repository_list["loaded_at"])}. '
+        "Orgs only show repositories the gh token is authorized for.</p>"
+    )
+    return summary + "".join(groups)
 
 
 SETTINGS_SCRIPT = """
@@ -984,9 +1341,60 @@ rulesBox.addEventListener('input', updateRules);
 updateRules();
 
 document.querySelector('form').addEventListener('submit', () => {
-  const order = [...document.querySelectorAll('.section-card')].map(card => card.dataset.index);
-  document.querySelector('[name=section_order]').value = order.join(',');
+  for (const [box, field] of [['.sections', 'section_order'], ['.tracked-sections', 'tracked_order']]) {
+    const order = [...document.querySelectorAll(box + ' .section-card')].map(card => card.dataset.index);
+    document.querySelector('[name=' + field + ']').value = order.join(',');
+  }
 });
+
+const repoGroups = document.getElementById('repo-groups');
+const repoStatus = document.getElementById('repo-status');
+const repoFilter = document.getElementById('repo-filter');
+
+function filterRepositories() {
+  const term = repoFilter.value.trim().toLowerCase();
+  for (const option of document.querySelectorAll('.repo-picker .repo-option')) {
+    option.hidden = Boolean(term) && !option.dataset.name.includes(term);
+  }
+  for (const group of repoGroups.querySelectorAll('.repo-group')) {
+    group.hidden = Boolean(term) && !group.querySelector('.repo-option:not([hidden])');
+  }
+}
+
+async function loadRepositories(reload) {
+  const chosen = new Set([...document.querySelectorAll('input[name=tracked_repo]:checked')].map(input => input.value));
+  repoStatus.textContent = reload ? 'Reloading the list from GitHub…' : 'Loading your repositories…';
+  let response;
+  try {
+    response = await fetch('/repositories' + (reload ? '?reload=1' : ''));
+    repoGroups.innerHTML = await response.text();
+    repoStatus.textContent = response.ok ? '' : 'Loading the list failed';
+  } catch (error) {
+    repoStatus.textContent = 'Loading the list failed';
+    return;
+  }
+  const selected = new Set([...document.querySelectorAll('#repo-selected input')].map(input => input.value));
+  const listed = new Set();
+  for (const input of repoGroups.querySelectorAll('input[name=tracked_repo]')) {
+    listed.add(input.value);
+    if (selected.has(input.value)) {
+      input.closest('.repo-option').remove();
+    } else {
+      input.checked = chosen.has(input.value);
+    }
+  }
+  for (const input of document.querySelectorAll('#repo-selected input')) {
+    const option = input.closest('.repo-option');
+    option.querySelector('.missing')?.remove();
+    if (response.ok && !listed.has(input.value)) {
+      option.insertAdjacentHTML('beforeend', '<span class="badge missing">not visible to the gh account</span>');
+    }
+  }
+  filterRepositories();
+}
+
+repoFilter.addEventListener('input', filterRepositories);
+loadRepositories(false);
 """
 
 
@@ -1007,7 +1415,8 @@ def render_settings(overview, saved):
     )
     rules = settings["rules"]
     rule_cards = "".join(rule_card(index, rule, rules) for index, rule in enumerate(rules))
-    rows = "".join(section_fields(index, section, rules) for index, section in enumerate(settings["sections"]))
+    rows = "".join(section_fields("section", index, section, rules) for index, section in enumerate(settings["sections"]))
+    tracked_rows = "".join(section_fields("tracked", index, section, rules) for index, section in enumerate(settings["tracked_sections"]))
     notice = '<span class="notice">Saved</span>' if saved else ""
     content = f"""<h1>Settings</h1>
 <form method="post" action="/settings">
@@ -1032,6 +1441,31 @@ def render_settings(overview, saved):
       the matching section with the lowest priority number</label>
     <input type="hidden" name="section_order" value="">
     <div class="sections">{rows}</div>
+  </fieldset>
+  <fieldset>
+    <legend>Tracked repositories</legend>
+    <p class="hint">The board gets a second row with the PRs of these repositories, in any state: open, draft, merged or closed.
+      Pick from every repository the gh account can see: your own public and private ones, orgs you belong to, and ones you collaborate on.</p>
+    <label>Show the <input type="number" name="tracked_per_repo" min="1" max="{MAX_PER_REPO}" value="{settings['tracked_per_repo']}">
+      most recently updated PRs of each repository</label>
+    <label><input type="checkbox" name="hide_my_prs_in_tracked"{checked_attribute(settings['hide_my_prs_in_tracked'])}> Hide PRs that already show in the My PRs row</label>
+    <div class="repo-tools">
+      <input type="search" id="repo-filter" placeholder="Filter repositories">
+      <button type="button" onclick="loadRepositories(true)">Reload list</button>
+      <span class="hint" id="repo-status"></span>
+    </div>
+    <div class="repo-picker">
+      {selected_repositories(settings, overview.repository_list)}
+      <div id="repo-groups"></div>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>Tracked repository sections</legend>
+    <p class="hint">The same sections apply to every tracked repository. They work like the sections above, without a query:
+      each one shows the tracked PRs that match its rule. With "Show each PR only in one section" on, a PR goes to the matching
+      section with the lowest priority number, which is how Merged and Closed keep finished PRs out of the others.</p>
+    <input type="hidden" name="tracked_order" value="">
+    <div class="tracked-sections">{tracked_rows}</div>
   </fieldset>
   <fieldset>
     <legend>Rules</legend>
@@ -1069,6 +1503,13 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(board_content(overview.fresh_board(max_age)))
         elif url.path == "/settings":
             self.respond(render_settings(overview, "saved" in parse_qs(url.query)))
+        elif url.path == "/repositories":
+            try:
+                self.respond(repository_groups(overview.repositories("reload" in parse_qs(url.query))))
+            except subprocess.CalledProcessError as error:
+                self.respond(f'<pre class="error">gh failed:\n{html.escape(error.stderr or "")}</pre>', 502)
+            except (KeyError, TypeError, ValueError) as error:
+                self.respond(f'<pre class="error">Unexpected response from gh: {html.escape(repr(error))}</pre>', 502)
         else:
             self.send_error(404)
 
@@ -1098,9 +1539,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def respond(self, text):
+    def respond(self, text, status=200):
         body = text.encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

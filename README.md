@@ -29,6 +29,7 @@ A column shows the PRs its query finds that match its rule, or every PR the quer
 
 | Condition | Values | Checks |
 |---|---|---|
+| State | `open` / `merged` / `closed` | whether the PR is open, merged, or closed without merging |
 | Draft | `yes` / `no` | the PR is marked as a draft |
 | Approved | `yes` / `no` | GitHub's review decision is Approved, following the repo's required reviews |
 | Changes requested | `yes` / `no` | a reviewer's latest review requests changes, and they haven't been asked to review again |
@@ -43,6 +44,12 @@ A column shows the PRs its query finds that match its rule, or every PR the quer
 The last two let rules build on each other. For example, the default **Has a problem** rule matches any of changes requested, CI failing or merge conflicts, and a rule with *all* of "Draft: no" and "Matches rule: Has a problem" shows non-draft PRs that need action. A condition that would make rules use each other in a loop is dropped when you save.
 
 With **Show each PR only in one section** on (the default), a PR that matches several columns only shows in the one with the lowest **Priority** number. The defaults use that: Draft (1, query `draft:true`), Needs action (2, rule "Has a problem"), Ready for merge (3, query `review:approved`), Waiting for reviewer (4, rule "Reviewers requested"), and Ready for review (5, no rule) catching the rest. Use the query for whatever GitHub search can express, and rules for what it can't, such as merge conflicts, "asked to review again", or "any of" combinations. Turn it off to show a PR in every column it matches.
+
+## Tracked repositories
+
+Besides your own PRs, the board can show a second row with the PRs of repositories you pick, in any state. In settings, **Tracked repositories** lists every repository the `gh` account can see, grouped as your public ones, your private ones, one group per org, and repositories you collaborate on, each marked public or private. Type in the filter to narrow the list, and check the ones to track. The list is cached in `~/.config/github-pr-overview/repositories.json`; **Reload list** fetches it again, for example after you join an org. An org only shows the repositories the `gh` token is authorized for: if an SSO org shows none, run `gh auth refresh` and authorize the token for that org.
+
+Each tracked repository contributes its most recently updated PRs (20 by default). They fall into the **Tracked repository sections**, which are shared by every tracked repository and work like the columns above without a query: Merged (1), Closed (2), Draft (3), Needs action (4), Ready for merge (5), Ready for review (6, reviewers requested), and Open (7) catching the rest. **Hide PRs that already show in the My PRs row** (on by default) keeps your own board's PRs out of this row. A repository that fails to load shows an error above the row; the rest still load.
 
 **Reset to defaults** restores the board above. Settings are saved in `~/.config/github-pr-overview/settings.json`.
 
