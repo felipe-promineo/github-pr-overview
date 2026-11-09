@@ -901,7 +901,7 @@ class Updater:
         with self._lock:
             try:
                 run_git("fetch", "--quiet", "origin")
-                self.pending = int(run_git("rev-list", "--count", "HEAD..@{upstream}"))
+                self.pending = int(run_git("rev-list", "--count", "HEAD", "@{upstream}", f"^{self.version['commit']}"))
                 self.error = None
             except GIT_ERRORS as error:
                 self.error = git_failure(error)
