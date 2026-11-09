@@ -53,43 +53,39 @@ Each tracked repository contributes its most recently updated PRs (20 by default
 
 **Reset to defaults** restores the board above. Settings are saved in `~/.config/github-pr-overview/settings.json`.
 
-## Requirements
+## Install
 
-- macOS (notifications use `terminal-notifier` and `afplay`)
-- Python 3 (standard library only)
-- [GitHub CLI](https://cli.github.com/), logged in: `gh auth login`
-- `terminal-notifier`: `brew install terminal-notifier`
+On a Mac with [Homebrew](https://brew.sh):
 
-## Run it
+```bash
+curl -fsSL https://raw.githubusercontent.com/felipe-promineo/github-pr-overview/main/install.sh | bash
+```
+
+Or from a clone: `./install.sh`. The installer:
+
+1. installs what's missing with Homebrew: `gh`, `terminal-notifier`, `git` and Python 3.8 or newer
+2. runs `gh auth login` if `gh` isn't logged in yet
+3. clones the app into `~/Repositories/github-pr-overview` (`--dir PATH` for another place; run from a clone, it uses that clone), or updates an existing clone
+4. writes `~/Library/LaunchAgents/github-pr-overview.plist` with the right paths and loads it, so the board runs now and starts at login (and restarts if it stops)
+5. adds the `gh pr-overview` (terminal list) and `gh pr-overview-web` (opens the board) aliases
+6. opens http://127.0.0.1:8765 (`--no-browser` to skip)
+
+At the end it lists the orgs the `gh` token can see. If an org's repositories don't show up in **Tracked repositories**, it probably uses SSO: run `gh auth refresh` and authorize the token for it at https://github.com/settings/tokens.
+
+**Update:** run the installer again. It pulls the clone and restarts the board.
+
+**Uninstall:** `./install.sh --uninstall` stops the board and removes the login item and the aliases. It keeps the clone and your settings in `~/.config/github-pr-overview`.
+
+The server logs to `/tmp/github-pr-overview.log`.
+
+## Manual setup
+
+Requirements: macOS (notifications use `terminal-notifier` and `afplay`), Python 3.8+ (standard library only), the [GitHub CLI](https://cli.github.com/) logged in with `gh auth login`, and `brew install terminal-notifier`.
 
 ```bash
 python3 github-pr-overview.py
 ```
 
-This serves the page on http://127.0.0.1:8765 and opens it in your browser. Pass `--no-browser` to only start the server.
+This serves the page on http://127.0.0.1:8765 and opens it in your browser. Pass `--no-browser` to only start the server. `github-pr-overview.sh` prints the same overview (without the review column) in the terminal.
 
-`github-pr-overview.sh` prints the same overview (without the review column) in the terminal.
-
-## Optional: gh aliases
-
-Add these under `aliases:` in `~/.config/gh/config.yml`, with the path to your clone:
-
-```yaml
-aliases:
-    pr-overview: '!/path/to/github-pr-overview/github-pr-overview.sh'
-    pr-overview-web: '!open http://127.0.0.1:8765'
-```
-
-Then `gh pr-overview` prints the list and `gh pr-overview-web` opens the page.
-
-## Optional: start at login
-
-1. Copy `github-pr-overview.plist` to `~/Library/LaunchAgents/`, renaming the file and its label if you like.
-2. Replace `/path/to/github-pr-overview` with the path to your clone, and check the `python3` path (`which python3`).
-3. Load it:
-
-   ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/github-pr-overview.plist
-   ```
-
-The server then starts at login and restarts if it stops. Its output goes to `/tmp/github-pr-overview.log`.
+To start it at login by hand, copy `github-pr-overview.plist` to `~/Library/LaunchAgents/`, replace `/path/to/github-pr-overview` with the path to your clone, check the `python3` path (`which python3`), and load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/github-pr-overview.plist`. After pulling changes, restart it with `launchctl kickstart -k gui/$(id -u)/github-pr-overview`.
