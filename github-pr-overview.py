@@ -38,6 +38,9 @@ REVIEW_REQUESTS = "is:pr is:open archived:false review-requested:@me -author:@me
 
 YES_NO = ["yes", "no"]
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+PULL_REQUEST_REFERENCE = re.compile(
+    r"(?:(?:https?://)?(?:www\.)?github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:#|/pulls?/)(\d+)(?:[/?#].*)?"
+)
 MAX_PER_REPO = 100
 PARALLEL_FETCHES = 6
 GATEWAY_ERRORS = ("HTTP 502", "HTTP 503", "HTTP 504")
@@ -133,6 +136,7 @@ DEFAULT_SETTINGS = {
     "hide_my_prs_in_tracked": True,
     "tracked_per_repo": 20,
     "tracked_repos": [],
+    "tracked_prs": [],
     "rules": [
         {"id": "needs_action", "name": "Has a problem", "match": "any", "conditions": [
             {"condition": "changes_requested", "value": "yes"},
@@ -165,7 +169,7 @@ DEFAULT_SETTINGS = {
     ],
 }
 
-LIST_SETTINGS = ("rules", "sections", "tracked_sections", "tracked_repos")
+LIST_SETTINGS = ("rules", "sections", "tracked_sections", "tracked_repos", "tracked_prs")
 
 PULL_REQUEST_FIELDS = """
 fragment PullRequestFields on PullRequest {
@@ -339,6 +343,26 @@ def normalized_repositories(raw):
     return list(dict.fromkeys(name for name in names if isinstance(name, str) and REPO_NAME.fullmatch(name)))
 
 
+def pull_request_reference(text):
+    match = PULL_REQUEST_REFERENCE.fullmatch(text.strip())
+    if not match or int(match.group(3)) == 0:
+        return None
+    owner, name, number = match.groups()
+    return f"{owner}/{name}#{int(number)}"
+
+
+def normalized_pull_request_references(raw):
+    texts = raw if isinstance(raw, list) else []
+    references = (pull_request_reference(text) for text in texts if isinstance(text, str))
+    return list(dict.fromkeys(reference for reference in references if reference))
+
+
+def split_pull_request_references(reference):
+    repository, number = reference.rsplit("#", 1)
+    owner, name = repository.split("/", 1)
+    return owner, name, number
+
+
 def non_empty_list(raw, key):
     value = raw.get(key)
     return value if isinstance(value, list) and value else DEFAULT_SETTINGS[key]
@@ -363,6 +387,7 @@ def normalized_settings(raw):
         for index, section in enumerate(non_empty_list(raw, "tracked_sections"))
     ]
     settings["tracked_repos"] = normalized_repositories(raw.get("tracked_repos"))
+    settings["tracked_prs"] = normalized_pull_request_references(raw.get("tracked_prs"))
     return settings
 
 
@@ -446,6 +471,7 @@ def settings_from_form(form):
         "hide_my_prs_in_tracked": checked("hide_my_prs_in_tracked"),
         "tracked_per_repo": number("tracked_per_repo"),
         "tracked_repos": form.get("tracked_repo", []),
+        "tracked_prs": re.split(r"[\s,]+", text("tracked_prs")),
         "rules": [
             {
                 "id": text(f"rule{index}_id"),
@@ -552,19 +578,49 @@ def fetch_repository(repository, per_repo):
     return data["r0"], None
 
 
+PULL_REQUEST_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{ pullRequest(number: $number) {{ ...PullRequestFields }} }}
+}}
+{PULL_REQUEST_FIELDS}"""
+
+
+def fetch_tracked_pull_request(reference):
+    owner, name, number = split_pull_request_references(reference)
+    arguments = [
+        "gh", "api", "graphql", "-f", f"query={PULL_REQUEST_QUERY}",
+        "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}",
+    ]
+    try:
+        data, errors = run_graphql(arguments)
+    except subprocess.CalledProcessError as error:
+        return None, (error.stderr or "gh failed").strip()
+    pull_request = (data.get("repository") or {}).get("pullRequest")
+    if errors or not pull_request:
+        return None, "; ".join(error.get("message", "unknown error") for error in errors) or "no such pull request"
+    return pull_request, None
+
+
 def fetch_pull_requests(settings):
     queries = section_queries(settings["sections"])
     repositories = settings["tracked_repos"]
+    references = settings["tracked_prs"]
     with ThreadPoolExecutor(PARALLEL_FETCHES) as pool:
         searches = pool.submit(fetch_searches, queries)
-        results = list(pool.map(lambda repository: fetch_repository(repository, settings["tracked_per_repo"]), repositories))
+        repository_results = pool.map(lambda repository: fetch_repository(repository, settings["tracked_per_repo"]), repositories)
+        pull_request_results = pool.map(fetch_tracked_pull_request, references)
+        repository_results, pull_request_results = list(repository_results), list(pull_request_results)
         data = searches.result()
-    repository_errors = {}
-    for index, (repository, (result, error)) in enumerate(zip(repositories, results)):
+    errors = {"repositories": {}, "pull_requests": {}}
+    for index, (repository, (result, error)) in enumerate(zip(repositories, repository_results)):
         data[f"r{index}"] = result
         if error is not None:
-            repository_errors[repository] = error
-    return data, repository_errors
+            errors["repositories"][repository] = error
+    for index, (reference, (result, error)) in enumerate(zip(references, pull_request_results)):
+        data[f"p{index}"] = result
+        if error is not None:
+            errors["pull_requests"][reference] = error
+    return data, errors
 
 
 REPOSITORY_LIST_QUERY = """
@@ -725,13 +781,19 @@ def group_pull_requests(data, settings):
     ]
     shown = {pr["url"] for items in groups for pr, _ in items} if settings["hide_my_prs_in_tracked"] else set()
     tracked = place_in_sections(settings["tracked_sections"], lambda section: tracked_nodes, settings, viewer_login, shown)
-    return groups, tracked
+    pull_request_nodes = valid_nodes([data.get(f"p{index}") for index in range(len(settings["tracked_prs"]))])
+    in_tracked_repositories = {pr["url"] for items in tracked for pr, _ in items}
+    tracked_prs = place_in_sections(
+        settings["tracked_sections"], lambda section: pull_request_nodes, settings, viewer_login, shown | in_tracked_repositories
+    )
+    return groups, tracked, tracked_prs
 
 
-def board_entries(settings, groups, tracked):
+def board_entries(settings, groups, tracked, tracked_prs):
     return [
         *((("mine", index), section, items) for index, (section, items) in enumerate(zip(settings["sections"], groups))),
         *((("tracked", index), section, items) for index, (section, items) in enumerate(zip(settings["tracked_sections"], tracked))),
+        *((("tracked_prs", index), section, items) for index, (section, items) in enumerate(zip(settings["tracked_sections"], tracked_prs))),
     ]
 
 
@@ -805,20 +867,21 @@ class Overview:
                 "settings": settings,
                 "groups": None,
                 "tracked": None,
-                "repository_errors": {},
+                "tracked_prs": None,
+                "errors": {"repositories": {}, "pull_requests": {}},
                 "error": None,
                 "loaded_at": time.monotonic(),
             }
             try:
-                data, board["repository_errors"] = fetch_pull_requests(settings)
-                board["groups"], board["tracked"] = group_pull_requests(data, settings)
+                data, board["errors"] = fetch_pull_requests(settings)
+                board["groups"], board["tracked"], board["tracked_prs"] = group_pull_requests(data, settings)
                 self.viewer = data["viewer"]
             except subprocess.CalledProcessError as error:
                 board["error"] = error.stderr
             except (KeyError, ValueError) as error:
                 board["error"] = f"Unexpected response from gh: {error!r}"
             if board["groups"] is not None:
-                self.notifier.update(board_entries(settings, board["groups"], board["tracked"]), settings)
+                self.notifier.update(board_entries(settings, board["groups"], board["tracked"], board["tracked_prs"]), settings)
             self.board = board
             return board
 
@@ -1077,9 +1140,11 @@ STYLE = """
   fieldset { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; margin: 0 0 16px; }
   legend { padding: 0 6px; font-weight: 600; }
   fieldset > label, fieldset > p { display: block; margin: 8px 0; }
-  input, select, button { font: inherit; color: inherit; background: #0d1117; border: 1px solid #30363d;
+  input, select, button, textarea { font: inherit; color: inherit; background: #0d1117; border: 1px solid #30363d;
                           border-radius: 6px; padding: 4px 8px; }
   input[type=checkbox] { padding: 0; }
+  textarea { display: block; width: 100%; box-sizing: border-box; resize: vertical;
+             font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
   input[type=number] { width: 4em; }
   input[type=color] { width: 36px; height: 30px; padding: 2px; }
   button { cursor: pointer; }
@@ -1279,16 +1344,31 @@ def board_content(board):
         return f'<pre class="error">gh failed:\n{html.escape(board["error"])}</pre>'
     settings = board["settings"]
     mine = section_columns(settings, "mine", settings["sections"], board["groups"])
-    if not settings["tracked_repos"]:
+    if not settings["tracked_repos"] and not settings["tracked_prs"]:
         return mine
-    errors = "".join(
-        f'<pre class="error row-errors">Couldn\'t load {html.escape(repository)}: {html.escape(message)}</pre>'
-        for repository, message in board["repository_errors"].items()
-    )
-    tracked = section_columns(settings, "tracked", settings["tracked_sections"], board["tracked"])
-    count = len(settings["tracked_repos"])
-    return f"""<div class="row"><h2 class="row-title">My PRs</h2>{mine}</div>
-<div class="row"><h2 class="row-title">Tracked repositories <span class="hint">{count} repo{'s' if count != 1 else ''}</span></h2>{errors}{tracked}</div>"""
+
+    def load_errors(kind):
+        return "".join(
+            f'<pre class="error row-errors">Couldn\'t load {html.escape(name)}: {html.escape(message)}</pre>'
+            for name, message in board["errors"][kind].items()
+        )
+
+    rows = [f'<div class="row"><h2 class="row-title">My PRs</h2>{mine}</div>']
+    if settings["tracked_repos"]:
+        tracked = section_columns(settings, "tracked", settings["tracked_sections"], board["tracked"])
+        count = len(settings["tracked_repos"])
+        rows.append(
+            f'<div class="row"><h2 class="row-title">Tracked repositories <span class="hint">{count} repo{"s" if count != 1 else ""}</span></h2>'
+            f'{load_errors("repositories")}{tracked}</div>'
+        )
+    if settings["tracked_prs"]:
+        tracked_prs = section_columns(settings, "tracked_prs", settings["tracked_sections"], board["tracked_prs"])
+        count = len(settings["tracked_prs"])
+        rows.append(
+            f'<div class="row"><h2 class="row-title">Tracked PRs <span class="hint">{count} PR{"s" if count != 1 else ""}</span></h2>'
+            f'{load_errors("pull_requests")}{tracked_prs}</div>'
+        )
+    return "\n".join(rows)
 
 
 def board_script(settings, updater):
@@ -1450,7 +1530,7 @@ def section_fields(kind, index, section, rules):
 
 def query_field(prefix, section):
     if "query" not in section:
-        return '<span class="field grow">Every PR in the tracked repositories</span>'
+        return '<span class="field grow">Every tracked PR (from tracked repositories or added one by one)</span>'
     return f'<label class="field grow">Query <input type="text" class="grow" name="{prefix}query" value="{html.escape(section["query"])}" required></label>'
 
 
@@ -1956,8 +2036,16 @@ def render_settings(overview, updater, saved, port_in_use):
     </div>
   </fieldset>
   <fieldset>
+    <legend>Tracked PRs</legend>
+    <p class="hint">Single PRs to follow even when you aren't part of them and their repository isn't tracked. They get their own row
+      on the board, in any state. Paste one per line, as a link (<code>https://github.com/owner/repo/pull/123</code>)
+      or as <code>owner/repo#123</code>; lines that are neither are dropped when you save. A PR that already shows in the
+      tracked repositories row (or in My PRs, with the option above on) isn't repeated.</p>
+    <textarea name="tracked_prs" rows="4" spellcheck="false" placeholder="owner/repo#123">{html.escape(chr(10).join(settings['tracked_prs']))}</textarea>
+  </fieldset>
+  <fieldset>
     <legend>Tracked repository sections</legend>
-    <p class="hint">The same sections apply to every tracked repository. They work like the sections above, without a query:
+    <p class="hint">The same sections apply to every tracked repository and to the tracked PRs. They work like the sections above, without a query:
       each one shows the tracked PRs that match its rule. With "Show each PR only in one section" on, a PR goes to the matching
       section with the lowest priority number, which is how Merged and Closed keep finished PRs out of the others.</p>
     <input type="hidden" name="tracked_order" value="">

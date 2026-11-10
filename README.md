@@ -11,6 +11,7 @@ A local web page that shows your GitHub pull requests as a board and sends a mac
 - [Settings](#settings)
   - [Sections and rules](#sections-and-rules)
   - [Tracked repositories](#tracked-repositories)
+  - [Tracked PRs](#tracked-prs)
 - [Updates](#updates)
 - [Command line](#command-line)
 - [Manual setup](#manual-setup)
@@ -67,7 +68,7 @@ The cog button opens the settings page:
 - **Start at login**: add or remove the login item (the same one the installer sets up). Switching restarts the board and the page follows it; turning it off keeps the board running until you log out
 - **Server**: the port; after saving, the board restarts there and the page follows (a port in use is refused)
 - **Notifications**: on or off, and the sound
-- **Sections**, **Rules**, **Tracked repositories**: see below
+- **Sections**, **Rules**, **Tracked repositories**, **Tracked PRs**: see below
 
 Leaving the page with unsaved changes asks whether to save first. **Reset to defaults** restores everything.
 
@@ -97,6 +98,10 @@ With **Show each PR only in one section** on (the default), a PR matching severa
 A second row can show the PRs of repositories you pick, in any state. The picker lists every repository the `gh` account can see, grouped into personal public, personal private, each org, and collaborations. Filter it, check the ones to track, and use **Reload list** after joining an org.
 
 Each repository contributes its most recently updated PRs (20 by default). They go into shared sections that work like the ones above, without a query: Merged, Closed, Draft, Needs action, Ready for merge, Ready for review and Open. **Hide PRs that already show in the My PRs row** is on by default. A repository that fails to load shows an error; the others still load.
+
+### Tracked PRs
+
+To follow single PRs you aren't part of, in repositories you don't track, paste them under **Tracked PRs**, one per line, as a link (`https://github.com/owner/repo/pull/123`) or as `owner/repo#123`. Lines that are neither are dropped on save. They get their own row on the board, in any state, sorted into the same sections as tracked repositories. A PR already shown in the tracked repositories row isn't repeated, nor one in My PRs while **Hide PRs that already show in the My PRs row** is on. A PR that fails to load (wrong number, or a repository the `gh` account can't see) shows an error; the others still load.
 
 ## Updates
 
