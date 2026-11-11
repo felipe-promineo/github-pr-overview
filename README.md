@@ -101,7 +101,7 @@ Each repository contributes its most recently updated PRs (20 by default). They 
 
 ### Tracked PRs
 
-To follow single PRs you aren't part of, in repositories you don't track, paste them under **Tracked PRs**, one per line, as a link (`https://github.com/owner/repo/pull/123`) or as `owner/repo#123`. Lines that are neither are dropped on save. They get their own row on the board, in any state, sorted into the same sections as tracked repositories. A PR already shown in the tracked repositories row isn't repeated, nor one in My PRs while **Hide PRs that already show in the My PRs row** is on. A PR that fails to load (wrong number, or a repository the `gh` account can't see) shows an error; the others still load.
+To follow single PRs you aren't part of, in repositories you don't track, paste them under **Tracked PRs**, one per line, as a link (`https://github.com/owner/repo/pull/123`) or as `owner/repo#123`. Lines that are neither are dropped on save. From a terminal, `python3 github-pr-overview.py add-pr LINK` adds one. They get their own row on the board, in any state, sorted into the same sections as tracked repositories. A PR already shown in the tracked repositories row isn't repeated, nor one in My PRs while **Hide PRs that already show in the My PRs row** is on. A PR that fails to load (wrong number, or a repository the `gh` account can't see) shows an error; the others still load.
 
 ## Updates
 
@@ -113,6 +113,7 @@ Turn on **Install updates automatically** in Settings → Updates to do that wit
 
 ```bash
 python3 github-pr-overview.py [--no-browser] [--show-port] [--set-port PORT]
+python3 github-pr-overview.py add-pr LINK
 ```
 
 | Option | Effect |
@@ -121,6 +122,7 @@ python3 github-pr-overview.py [--no-browser] [--show-port] [--set-port PORT]
 | `--no-browser` | serve without opening it |
 | `--show-port` | print the port, then exit |
 | `--set-port PORT` | save a port (used on the next start), then exit |
+| `add-pr LINK` | add a PR (link or `owner/repo#123`) to [Tracked PRs](#tracked-prs), then exit; a running board picks it up right away |
 
 `github-pr-overview.sh` prints your PRs in the terminal.
 

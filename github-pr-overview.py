@@ -14,7 +14,9 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 DEFAULT_PORT = 8765
 FRESH_SECONDS = 15
@@ -417,6 +419,12 @@ def save_settings(settings):
     temporary_path = SETTINGS_PATH.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(settings, indent=2))
     os.replace(temporary_path, SETTINGS_PATH)
+
+
+def with_tracked_pull_request(settings, reference):
+    if reference in settings["tracked_prs"]:
+        return None
+    return {**settings, "tracked_prs": [*settings["tracked_prs"], reference]}
 
 
 def load_repository_list():
@@ -2138,6 +2146,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/update/check":
             self.server.updater.check()
             self.respond(update_status(self.server.updater), content_type="text/plain", headers=self.update_headers())
+        elif path == "/tracked-prs/add":
+            self.add_tracked_pull_request(form.get("reference", [""])[0])
         elif path == "/settings/sound":
             play_sound(form.get("sound", [""])[0])
             self.send_response(204)
@@ -2196,6 +2206,19 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(render_updating(commit, next_path or local_path(urlsplit(self.headers.get("Referer", "")).path)))
             restart_server(self.server)
 
+    def add_tracked_pull_request(self, text):
+        reference = pull_request_reference(text)
+        if reference is None:
+            self.respond(f"Not a PR link or owner/repo#number: {text}", 400, content_type="text/plain")
+            return
+        settings = with_tracked_pull_request(self.server.overview.settings, reference)
+        if settings is None:
+            self.respond(f"Already tracked: {reference}", content_type="text/plain")
+            return
+        save_settings(settings)
+        self.server.overview.change_settings(settings)
+        self.respond(f"Added {reference}", content_type="text/plain")
+
     def apply_settings(self, settings, next_path):
         previous = self.server.overview.settings
         if settings["auto_update"] and not previous["auto_update"]:
@@ -2235,12 +2258,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 USAGE = """Usage: github-pr-overview.py [--no-browser] [--show-port] [--set-port PORT]
+       github-pr-overview.py add-pr LINK
 
   (no option)      serve the board and open it in the browser
   --no-browser     serve the board without opening it
   --show-port      print the port the board uses, then exit
   --set-port PORT  save PORT (1024-65535) as the port to use, then exit;
-                   a running board keeps its port until it restarts"""
+                   a running board keeps its port until it restarts
+  add-pr LINK      add a PR (link or owner/repo#123) to Tracked PRs, then exit;
+                   a running board picks it up right away"""
 
 
 def set_port(value):
@@ -2251,6 +2277,28 @@ def set_port(value):
     settings["port"] = port
     save_settings(settings)
     print(f"Saved port {port}")
+
+
+def add_pull_request(text):
+    reference = pull_request_reference(text)
+    if reference is None:
+        sys.exit(f"Not a PR link or owner/repo#number: {text}")
+    request = Request(
+        f"http://127.0.0.1:{load_settings()['port']}/tracked-prs/add",
+        data=urlencode({"reference": reference}).encode(),
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            print(response.read().decode())
+        return
+    except URLError:
+        pass
+    settings = with_tracked_pull_request(load_settings(), reference)
+    if settings is None:
+        print(f"Already tracked: {reference}")
+        return
+    save_settings(settings)
+    print(f"Added {reference}")
 
 
 def serve(open_browser):
@@ -2287,7 +2335,11 @@ def serve(open_browser):
 
 if __name__ == "__main__":
     arguments = sys.argv[1:]
-    if "-h" in arguments or "--help" in arguments:
+    if arguments[:1] == ["add-pr"]:
+        if len(arguments) != 2:
+            sys.exit("add-pr needs one PR link or owner/repo#number")
+        add_pull_request(arguments[1])
+    elif "-h" in arguments or "--help" in arguments:
         print(USAGE)
     elif "--show-port" in arguments:
         print(load_settings()["port"])
